@@ -1,13 +1,26 @@
 import asyncio
 import logging
+import os
 import secrets
+import shutil
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+
+
 class FetchBudgetExceeded(RuntimeError):
-    pass
+    def __init__(self, fetched: int, budget: int, size: int) -> None:
+        self.fetched = fetched
+        self.budget = budget
+        self.size = size
+        super().__init__(
+            f"Source read hard limit reached "
+            f"({fetched // 1024 // 1024}MB read, {budget // 1024 // 1024}MB limit)."
+        )
 
 
 class InvalidRange(ValueError):
@@ -20,9 +33,18 @@ class MediaRegistration:
     size: int
     filename: str
     budget: int
+    hard_budget: int | None = None
+    budget_growth: int = 16 * 1024 * 1024
     fetched: int = 0
     cache_hits: int = 0
+    disk_hits: int = 0
     failure: Exception | None = None
+    cache_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.hard_budget is None:
+            self.hard_budget = self.budget
+        self.hard_budget = max(self.budget, min(self.size, self.hard_budget))
 
 
 def parse_byte_range(value: str | None, size: int) -> tuple[int, int, bool]:
@@ -83,15 +105,35 @@ class MTProtoRangeServer:
         await web.TCPSite(self.runner, "127.0.0.1", self.port).start()
 
     async def stop(self) -> None:
+        for key in list(self.registrations):
+            self.unregister(key)
         if self.runner:
             await self.runner.cleanup()
             self.runner = None
 
-    def register(self, media: Any, size: int, filename: str, budget: int) -> tuple[str, str]:
+    def register(
+        self,
+        media: Any,
+        size: int,
+        filename: str,
+        budget: int,
+        *,
+        hard_budget: int | None = None,
+        budget_growth: int = 16 * 1024 * 1024,
+    ) -> tuple[str, str]:
         if media is None:
             raise RuntimeError("Telegram message does not contain downloadable media.")
         key = secrets.token_urlsafe(18)
-        self.registrations[key] = MediaRegistration(media, size, filename, budget)
+        cache_dir = Path(tempfile.mkdtemp(prefix=f"vthumb_range_{key}_"))
+        self.registrations[key] = MediaRegistration(
+            media,
+            size,
+            filename,
+            budget,
+            hard_budget=hard_budget,
+            budget_growth=budget_growth,
+            cache_dir=cache_dir,
+        )
         self.source_locks[key] = asyncio.Lock()
         return key, f"http://127.0.0.1:{self.port}/media/{key}"
 
@@ -104,12 +146,17 @@ class MTProtoRangeServer:
         self.source_locks.pop(key, None)
         if registration:
             logging.info(
-                "MTProto source finished: file=%r fetched=%d bytes cache_hits=%d budget=%d bytes",
+                "MTProto source finished: file=%r fetched=%d bytes memory_hits=%d "
+                "disk_hits=%d budget=%d hard_budget=%d bytes",
                 registration.filename,
                 registration.fetched,
                 registration.cache_hits,
+                registration.disk_hits,
                 registration.budget,
+                registration.hard_budget,
             )
+            if registration.cache_dir:
+                shutil.rmtree(registration.cache_dir, ignore_errors=True)
         for cache_key in [item for item in self.cache if item[0] == key]:
             self.cache_size -= len(self.cache.pop(cache_key))
 
@@ -163,6 +210,9 @@ class MTProtoRangeServer:
         cached = self._take_cached(cache_key, registration)
         if cached is not None:
             return cached
+        cached = self._take_disk_cached(cache_key, registration)
+        if cached is not None:
+            return cached
 
         source_lock = self.source_locks.setdefault(key, asyncio.Lock())
         async with source_lock:
@@ -171,13 +221,13 @@ class MTProtoRangeServer:
             cached = self._take_cached(cache_key, registration)
             if cached is not None:
                 return cached
+            cached = self._take_disk_cached(cache_key, registration)
+            if cached is not None:
+                return cached
 
             offset = chunk_index * self.chunk_size
             expected = min(self.chunk_size, registration.size - offset)
-            if registration.fetched + expected > registration.budget:
-                raise FetchBudgetExceeded(
-                    f"Source read budget reached ({registration.budget // 1024 // 1024}MB)."
-                )
+            self._ensure_budget(registration, expected)
 
             iterator = self.client.iter_download(
                 registration.media,
@@ -195,12 +245,76 @@ class MTProtoRangeServer:
                 raise RuntimeError("Telegram returned an empty media chunk.")
 
             registration.fetched += len(chunk)
-            self.cache[cache_key] = chunk
-            self.cache_size += len(chunk)
-            while self.cache_size > self.cache_bytes and self.cache:
-                _, removed = self.cache.popitem(last=False)
-                self.cache_size -= len(removed)
+            self._store_disk_chunk(registration, chunk_index, chunk)
+            self._store_memory_chunk(cache_key, chunk)
             return chunk
+
+    @staticmethod
+    def _ensure_budget(registration: MediaRegistration, expected: int) -> None:
+        needed = registration.fetched + expected
+        if needed <= registration.budget:
+            return
+
+        hard_budget = registration.hard_budget or registration.budget
+        if needed > hard_budget:
+            raise FetchBudgetExceeded(registration.fetched, hard_budget, registration.size)
+
+        old_budget = registration.budget
+        growth = max(expected, registration.budget_growth)
+        registration.budget = min(hard_budget, max(needed, old_budget + growth))
+        logging.info(
+            "MTProto source budget expanded: file=%r old=%d new=%d hard=%d bytes",
+            registration.filename,
+            old_budget,
+            registration.budget,
+            hard_budget,
+        )
+
+    def _take_disk_cached(
+        self,
+        cache_key: tuple[str, int],
+        registration: MediaRegistration,
+    ) -> bytes | None:
+        if not registration.cache_dir:
+            return None
+        path = registration.cache_dir / f"{cache_key[1]}.chunk"
+        try:
+            chunk = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            logging.warning("Could not read range cache chunk (%s)", type(exc).__name__)
+            return None
+        registration.disk_hits += 1
+        self._store_memory_chunk(cache_key, chunk)
+        return chunk
+
+    def _store_disk_chunk(
+        self,
+        registration: MediaRegistration,
+        chunk_index: int,
+        chunk: bytes,
+    ) -> None:
+        if not registration.cache_dir:
+            return
+        path = registration.cache_dir / f"{chunk_index}.chunk"
+        temporary = path.with_suffix(".tmp")
+        try:
+            temporary.write_bytes(chunk)
+            os.replace(temporary, path)
+        except OSError as exc:
+            logging.warning("Could not persist range cache chunk (%s)", type(exc).__name__)
+            temporary.unlink(missing_ok=True)
+
+    def _store_memory_chunk(self, cache_key: tuple[str, int], chunk: bytes) -> None:
+        previous = self.cache.pop(cache_key, None)
+        if previous is not None:
+            self.cache_size -= len(previous)
+        self.cache[cache_key] = chunk
+        self.cache_size += len(chunk)
+        while self.cache_size > self.cache_bytes and self.cache:
+            _, removed = self.cache.popitem(last=False)
+            self.cache_size -= len(removed)
 
     def _take_cached(
         self,

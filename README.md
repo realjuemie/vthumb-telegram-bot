@@ -2,15 +2,16 @@
 
 一个可 Docker 部署的 Telegram 视频缩略图机器人。它通过 MTProto 按需读取视频分块，使用 FFprobe / FFmpeg 远程定位画面，再由 Pillow 生成带媒体信息和时间戳的视频联系表。
 
-机器人不会先把完整源视频保存到磁盘。针对大视频还提供可配置的读取预算，达到上限后主动停止，避免任务退化为全量下载。
+机器人不会预先下载完整源视频。它只读取 FFprobe / FFmpeg 实际请求的分块，并使用任务级临时缓存避免重复下载；大视频达到自适应硬上限后会主动停止。
 
 ## 功能
 
 - 普通视频和“作为文件发送”的视频均可处理
 - MTProto 分块读取，不受 Bot API `getFile` 的 20MB 下载限制
 - 512KB 对齐的 HTTP Range 读取
-- 有上限的 LRU 内存缓存，重复 Range 请求不会重复下载
-- 大视频读取比例和绝对流量双重限制
+- LRU 内存缓存 + 任务级临时磁盘缓存，内存淘汰后仍不会重复下载
+- 小文件兼容模式与大视频自适应读取预算
+- 大视频读取比例和绝对流量双重硬限制
 - PotPlayer 风格 PNG 联系表
 - 文件名、文件大小、分辨率、帧率、视频/音频编码、时长
 - 第一帧提前取样，减少第一张画面过晚的问题
@@ -34,7 +35,8 @@ Telethon / MTProto 原生媒体对象
        |
        +--> 512KB Telegram 分块读取
        +--> LRU 内存缓存
-       +--> 每任务读取预算
+       +--> 任务级临时磁盘分块缓存
+       +--> 自适应读取预算与硬上限
        |
        v
 FFprobe 读取媒体信息
@@ -47,7 +49,7 @@ Pillow 合成 PNG
 Telethon 上传成品
 ```
 
-源视频不会写入磁盘。磁盘中只会短暂出现单张 JPEG 帧和最终 PNG，任务结束后自动删除。
+机器人不会创建完整源视频文件。已读取的 512KB 分块、单张 JPEG 帧和最终 PNG 会写入任务级临时目录，任务结束后自动删除。小文件在 FFmpeg 确实需要时可能读取完整范围；大视频始终受比例与绝对容量硬上限保护。
 
 ## 默认设置
 
@@ -239,10 +241,13 @@ HTTPS_PROXY=http://host.docker.internal:7897
 | `THUMB_WIDTH` | `1920` | 输出 PNG 宽度 |
 | `MAX_CONCURRENT_JOBS` | `1` | 同时处理的视频数量 |
 | `FFMPEG_TIMEOUT` | `90` | 单次 FFprobe / FFmpeg 超时秒数 |
-| `RANGE_CACHE_MB` | `128` | 每个运行实例的 Range 内存缓存上限 |
-| `MAX_SOURCE_FETCH_MB` | `256` | 单任务最大源视频读取量 |
-| `MAX_SOURCE_FETCH_RATIO` | `0.35` | 大视频最大读取比例 |
-| `MIN_SOURCE_FETCH_MB` | `32` | 小视频最低读取预算 |
+| `RANGE_CACHE_MB` | `128` | Range 内存缓存上限；淘汰分块仍保留在任务级临时磁盘缓存 |
+| `MAX_SOURCE_FETCH_MB` | `256` | 大视频单任务绝对读取硬上限 |
+| `MAX_SOURCE_FETCH_RATIO` | `0.35` | 大视频初始读取预算比例 |
+| `HARD_SOURCE_FETCH_RATIO` | `0.55` | 大视频最大读取比例硬上限 |
+| `MIN_SOURCE_FETCH_MB` | `32` | 大视频初始读取预算下限 |
+| `SMALL_FILE_FULL_READ_MB` | `64` | 小文件兼容阈值，范围读取可按需扩展到整个文件 |
+| `SOURCE_FETCH_GROWTH_MB` | `16` | 预算每次自适应增加的容量 |
 | `MT_PROXY_URL` | 空 | MTProto HTTP / SOCKS5 代理 |
 | `DEBIAN_MIRROR` | 空 | Docker 构建 Debian 镜像地址 |
 | `PIP_INDEX_URL` | `https://pypi.org/simple` | Docker 构建 PyPI 地址 |
@@ -251,7 +256,9 @@ HTTPS_PROXY=http://host.docker.internal:7897
 
 ## 读取预算
 
-单任务预算计算方式：
+文件不超过 `SMALL_FILE_FULL_READ_MB` 时，读取硬上限等于文件大小。机器人仍按需请求分块，并不会一开始就下载整个文件。
+
+大视频初始预算：
 
 ```text
 min(
@@ -261,13 +268,25 @@ min(
 )
 ```
 
-默认情况下：
+大视频硬上限：
 
-- 小文件可能允许读取完整内容，以保证兼容索引位于文件末尾的视频。
-- 大文件最多读取 35%，且不会超过 256MB。
-- 达到预算后任务主动停止并向用户提示。
+```text
+min(
+  文件大小,
+  MAX_SOURCE_FETCH_MB,
+  max(SMALL_FILE_FULL_READ_MB, 文件大小 * HARD_SOURCE_FETCH_RATIO)
+)
+```
 
-这能限制大视频流量，但也意味着关键帧极少、索引结构特殊或不利于随机读取的视频可能无法完成所有截图。
+读取达到初始预算后，只在 FFmpeg 仍请求新分块时按 `SOURCE_FETCH_GROWTH_MB` 逐步扩展，直到硬上限。默认情况下：
+
+- 64MB 以内的小文件可以按需读取完整范围，兼容索引在末尾或关键帧稀疏的视频。
+- 大视频初始预算为 35%，可按需提升至 55%。
+- 无论比例如何，大视频最多读取 256MB。
+- 已下载分块即使从 128MB 内存缓存中淘汰，也会从临时磁盘复用，不重复计入网络读取量。
+- 达到硬上限后任务主动停止并向用户显示实际读取量。
+
+视频时长并不决定读取量。码率、封装索引位置和关键帧间隔更直接影响随机截帧所需的数据。
 
 ## 持久化数据
 
@@ -354,11 +373,17 @@ docker compose logs --tail 200
 说明视频在随机定位时需要读取较多内容。可以适当提高：
 
 ```dotenv
-MAX_SOURCE_FETCH_RATIO=0.5
+HARD_SOURCE_FETCH_RATIO=0.65
 MAX_SOURCE_FETCH_MB=512
 ```
 
-提高限制会增加网络流量和内存缓存压力，不建议直接取消预算。
+也可以仅提高小文件兼容阈值：
+
+```dotenv
+SMALL_FILE_FULL_READ_MB=96
+```
+
+提高限制会增加网络和临时磁盘用量，不建议直接取消大视频硬上限。
 
 ### 图片在 Telegram 中变模糊
 

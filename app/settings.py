@@ -33,7 +33,10 @@ class Settings:
     range_cache_mb: int
     max_source_fetch_mb: int
     max_source_fetch_ratio: float
+    hard_source_fetch_ratio: float
     min_source_fetch_mb: int
+    small_file_full_read_mb: int
+    source_fetch_growth_mb: int
     mt_proxy_url: str | None
     admin_ids: frozenset[int]
     access_file: str
@@ -57,7 +60,19 @@ class Settings:
 
     def source_fetch_budget(self, file_size: int) -> int:
         mib = 1024 * 1024
+        if file_size <= self.small_file_full_read_mb * mib:
+            return file_size
         ratio_budget = max(self.min_source_fetch_mb * mib, int(file_size * self.max_source_fetch_ratio))
+        return min(file_size, self.max_source_fetch_mb * mib, ratio_budget)
+
+    def source_fetch_hard_budget(self, file_size: int) -> int:
+        mib = 1024 * 1024
+        if file_size <= self.small_file_full_read_mb * mib:
+            return file_size
+        ratio_budget = max(
+            self.small_file_full_read_mb * mib,
+            int(file_size * self.hard_source_fetch_ratio),
+        )
         return min(file_size, self.max_source_fetch_mb * mib, ratio_budget)
 
     @classmethod
@@ -80,7 +95,10 @@ class Settings:
             range_cache_mb=_int_env("RANGE_CACHE_MB", 128),
             max_source_fetch_mb=_int_env("MAX_SOURCE_FETCH_MB", 256),
             max_source_fetch_ratio=_float_env("MAX_SOURCE_FETCH_RATIO", 0.35),
+            hard_source_fetch_ratio=_float_env("HARD_SOURCE_FETCH_RATIO", 0.55),
             min_source_fetch_mb=_int_env("MIN_SOURCE_FETCH_MB", 32),
+            small_file_full_read_mb=_int_env("SMALL_FILE_FULL_READ_MB", 64),
+            source_fetch_growth_mb=_int_env("SOURCE_FETCH_GROWTH_MB", 16),
             mt_proxy_url=os.getenv("MT_PROXY_URL") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"),
             admin_ids=_int_set_env("ADMIN_IDS"),
             access_file=os.getenv("ACCESS_FILE", "/data/access.json"),

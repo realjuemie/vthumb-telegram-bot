@@ -27,8 +27,8 @@ from .vthumb import SourceInfo, create_contact_sheet
 VIDEO_MIME_PREFIX = "video/"
 BOT_COMMANDS = (
     ("start", "开始使用并查看视频发送方式"),
-    ("help", "查看使用说明和读取限制"),
-    ("status", "查看机器人当前运行配置"),
+    ("help", "查看使用说明和自适应读取策略"),
+    ("status", "查看缩略图设置和读取预算"),
     ("setting", "选择每个用户独立的缩略图预设"),
     ("id", "查看自己的 Telegram 用户 ID"),
     ("add", "管理员：添加授权用户"),
@@ -171,7 +171,10 @@ async def handle_command(
 
     if command == "start":
         if is_allowed:
-            text = "发送视频或以文件形式发送视频，我会按需读取分块并生成缩略图。\n\n使用 /help 查看详细说明。"
+            text = (
+                "发送视频或以文件形式发送视频，我会按需读取分块并生成缩略图。\n"
+                "不会预先完整下载大视频。\n\n使用 /help 查看详细说明。"
+            )
         else:
             text = permission_message(user_id)
     elif command == "help":
@@ -182,7 +185,11 @@ async def handle_command(
                 "使用说明：\n"
                 "1. 直接发送视频，或将视频作为文件发送。\n"
                 "2. 使用 /setting 选择帧数与横竖布局。\n"
-                "3. 源视频不写入磁盘，大视频达到读取预算时会主动停止。"
+                f"3. {settings.small_file_full_read_mb}MB 以内按需读取，必要时可读取完整范围。\n"
+                f"4. 大视频初始读取预算 {settings.max_source_fetch_ratio:.0%}，"
+                f"按需提升至 {settings.hard_source_fetch_ratio:.0%}，"
+                f"且不超过 {settings.max_source_fetch_mb}MB。\n"
+                "5. 已读取分块会临时缓存，任务结束后自动删除。"
             )
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
@@ -198,8 +205,11 @@ async def handle_command(
                 "运行状态：正常\n"
                 f"缩略图：{preset.label} / {settings.thumb_width}px\n"
                 f"发送方式：{delivery_label(delivery)}\n"
-                f"分块缓存：{settings.range_cache_mb}MB\n"
-                f"大视频读取预算：{settings.max_source_fetch_ratio:.0%}，最高 {settings.max_source_fetch_mb}MB"
+                f"分块缓存：{settings.range_cache_mb}MB 内存 + 临时磁盘去重\n"
+                f"小文件阈值：{settings.small_file_full_read_mb}MB\n"
+                f"大视频预算：初始 {settings.max_source_fetch_ratio:.0%}，"
+                f"按需至 {settings.hard_source_fetch_ratio:.0%}，"
+                f"最高 {settings.max_source_fetch_mb}MB"
             )
     elif command == "setting":
         if not is_allowed:
@@ -296,7 +306,7 @@ class ProgressReporter:
     async def create(cls, client: TelegramClient, chat_id: int, reply_to: int) -> "ProgressReporter":
         message = await client.send_message(
             chat_id,
-            "收到，准备按需读取视频分块。",
+            "收到，准备按需读取视频分块。大视频不会预先完整下载。",
             reply_to=reply_to,
         )
         return cls(client, chat_id, message.id)
@@ -344,7 +354,12 @@ class ProgressReporter:
 
 def user_error_message(exc: Exception) -> str:
     if isinstance(exc, FetchBudgetExceeded):
-        return "这个视频在随机截帧时达到了分块读取上限。为避免接近全量下载，任务已主动停止。"
+        fetched_mb = exc.fetched / 1024 / 1024
+        limit_mb = exc.budget / 1024 / 1024
+        return (
+            f"这个视频的索引或关键帧不利于随机截取，已读取 {fetched_mb:.1f}MB，"
+            f"达到自适应硬上限 {limit_mb:.1f}MB。为避免接近全量下载，任务已主动停止。"
+        )
     if isinstance(exc, subprocess.TimeoutExpired):
         return "截帧超时，请稍后重试，或提高 FFMPEG_TIMEOUT。"
     if isinstance(exc, subprocess.CalledProcessError):
@@ -384,6 +399,8 @@ async def process_message(
                 file_size,
                 Path(filename).name,
                 settings.source_fetch_budget(file_size),
+                hard_budget=settings.source_fetch_hard_budget(file_size),
+                budget_growth=settings.source_fetch_growth_mb * 1024 * 1024,
             )
             output = tmp_dir / f"{Path(filename).name}.png"
             source = SourceInfo(

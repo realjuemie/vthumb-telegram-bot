@@ -85,6 +85,45 @@ class ChunkCacheTests(unittest.IsolatedAsyncioTestCase):
             await server._get_chunk("source", registration, 1)
         self.assertEqual(client.calls, 1)
 
+    async def test_budget_expands_until_hard_limit(self) -> None:
+        client = FakeTelegramClient()
+        server = MTProtoRangeServer(client, chunk_size=8, cache_bytes=16)
+        registration = MediaRegistration(
+            object(),
+            24,
+            "test.mp4",
+            budget=8,
+            hard_budget=16,
+            budget_growth=8,
+        )
+
+        await server._get_chunk("source", registration, 0)
+        await server._get_chunk("source", registration, 1)
+
+        self.assertEqual(registration.budget, 16)
+        with self.assertRaises(FetchBudgetExceeded):
+            await server._get_chunk("source", registration, 2)
+        self.assertEqual(client.calls, 2)
+
+    async def test_evicted_chunk_is_reused_from_disk(self) -> None:
+        client = FakeTelegramClient()
+        server = MTProtoRangeServer(client, chunk_size=8, cache_bytes=8)
+        key, _ = server.register(object(), 24, "test.mp4", budget=16)
+        registration = server.registrations[key]
+        cache_dir = registration.cache_dir
+
+        first = await server._get_chunk(key, registration, 0)
+        await server._get_chunk(key, registration, 1)
+        repeated = await server._get_chunk(key, registration, 0)
+
+        self.assertEqual(first, repeated)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(registration.fetched, 16)
+        self.assertEqual(registration.disk_hits, 1)
+        server.unregister(key)
+        self.assertIsNotNone(cache_dir)
+        self.assertFalse(cache_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
