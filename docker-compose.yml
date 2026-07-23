@@ -1,0 +1,32 @@
+services:
+  vthumb-bot:
+    build:
+      context: .
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    container_name: vthumb-bot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      ADMIN_IDS: ${ADMIN_IDS}
+      ACCESS_FILE: /data/access.json
+      PREFERENCES_FILE: /data/preferences.json
+      THUMB_WIDTH: ${THUMB_WIDTH:-1920}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-1}
+      FFMPEG_TIMEOUT: ${FFMPEG_TIMEOUT:-90}
+      RANGE_CACHE_MB: ${RANGE_CACHE_MB:-128}
+      MAX_SOURCE_FETCH_MB: ${MAX_SOURCE_FETCH_MB:-256}
+      MAX_SOURCE_FETCH_RATIO: ${MAX_SOURCE_FETCH_RATIO:-0.35}
+      MIN_SOURCE_FETCH_MB: ${MIN_SOURCE_FETCH_MB:-32}
+      MT_PROXY_URL: ${MT_PROXY_URL:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      http_proxy: ${http_proxy:-}
+      https_proxy: ${https_proxy:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+      no_proxy: ${no_proxy:-localhost,127.0.0.1}
+    volumes:
+      - ./data:/data
