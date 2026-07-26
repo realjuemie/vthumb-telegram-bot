@@ -5,3 +5,8 @@ debug-logs/
 data/
 .pytest_cache/
 *.session
+
+# Local dev snapshots of files (pre-edit backups, never tracked)
+.bak_snapshots_*
+*.bak
+*.bak.*

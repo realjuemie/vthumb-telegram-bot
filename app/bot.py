@@ -18,10 +18,16 @@ from .user_preferences import (
     DELIVERY_MEDIA,
     PRESETS,
     PRESETS_BY_KEY,
+    THEME_LABELS,
+    THEMES,
     ThumbnailPreset,
     UserPreferences,
 )
-from .vthumb import SourceInfo, create_contact_sheet
+from .vthumb import (
+    THEME_BY_NAME,
+    SourceInfo,
+    create_contact_sheet,
+)
 
 
 VIDEO_MIME_PREFIX = "video/"
@@ -104,17 +110,18 @@ def delivery_label(delivery: str) -> str:
     return "文件发送（原图）" if delivery == DELIVERY_FILE else "媒体发送（TG压缩）"
 
 
-def setting_text(preset: ThumbnailPreset, delivery: str) -> str:
+def setting_text(preset: ThumbnailPreset, delivery: str, theme: str) -> str:
     return (
         "缩略图设置（横x竖）\n"
         f"当前布局：{preset.label}\n"
-        f"发送方式：{delivery_label(delivery)}\n\n"
+        f"发送方式：{delivery_label(delivery)}\n"
+        f"主题风格：{THEME_LABELS.get(theme, theme)}\n\n"
         "提示：文件发送保留原图；媒体发送会被 Telegram 压缩。\n"
         "点击下方按钮切换，只影响你自己的任务。"
     )
 
 
-def setting_buttons(current: ThumbnailPreset, delivery: str) -> list[list[Button]]:
+def setting_buttons(current: ThumbnailPreset, delivery: str, theme: str) -> list[list[Button]]:
     buttons = []
     for preset in PRESETS:
         marker = "✓ " if preset == current else ""
@@ -130,7 +137,25 @@ def setting_buttons(current: ThumbnailPreset, delivery: str) -> list[list[Button
         Button.inline(media_marker + "媒体发送（TG压缩）", data=b"delivery:media"),
         Button.inline(file_marker + "文件发送（原图）", data=b"delivery:file"),
     ]
-    return [buttons[:2], buttons[2:], delivery_buttons]
+    # Theme rows: 2 buttons per row, chunked automatically so adding a new theme
+    # (4 -> 6 themes so far) doesn't require a layout rewrite. Callbacks are
+    # `theme:<theme-name>` decoded by `theme_from_callback`.
+    theme_buttons: list[Button] = []
+    for theme_name in THEMES:
+        marker = "✓ " if theme_name == theme else ""
+        theme_buttons.append(
+            Button.inline(
+                marker + THEME_LABELS[theme_name],
+                data=f"theme:{theme_name}".encode("ascii"),
+            )
+        )
+    theme_rows = [theme_buttons[i : i + 2] for i in range(0, len(theme_buttons), 2)]
+    return [
+        buttons[:2],
+        buttons[2:],
+        delivery_buttons,
+        *theme_rows,
+    ]
 
 
 def setting_from_callback(data: bytes) -> ThumbnailPreset | None:
@@ -151,6 +176,16 @@ def delivery_from_callback(data: bytes) -> str | None:
     if prefix != "delivery" or delivery not in {DELIVERY_MEDIA, DELIVERY_FILE}:
         return None
     return delivery
+
+
+def theme_from_callback(data: bytes) -> str | None:
+    try:
+        prefix, theme = data.decode("ascii").split(":", 1)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if prefix != "theme" or theme not in THEME_BY_NAME:
+        return None
+    return theme
 
 
 async def handle_command(
@@ -217,8 +252,9 @@ async def handle_command(
         else:
             preset = preferences.get(user_id)
             delivery = preferences.get_delivery(user_id)
-            text = setting_text(preset, delivery)
-            buttons = setting_buttons(preset, delivery)
+            theme = preferences.get_theme(user_id)
+            text = setting_text(preset, delivery, theme)
+            buttons = setting_buttons(preset, delivery, theme)
     elif command in {"add", "del", "users"}:
         if not is_admin:
             text = "此命令仅限管理员使用。"
@@ -363,7 +399,22 @@ def user_error_message(exc: Exception) -> str:
     if isinstance(exc, subprocess.TimeoutExpired):
         return "截帧超时，请稍后重试，或提高 FFMPEG_TIMEOUT。"
     if isinstance(exc, subprocess.CalledProcessError):
-        return "无法读取或截取这个视频，可能是格式、远程读取或代理连接问题。"
+        # Surface the actual ffmpeg error to the user instead of a generic message.
+        # ffmpeg's stderr/stdout was captured but never logged previously -- the
+        # catch was swallowing the diagnostic. Embed a short excerpt in the user
+        # message; the full stderr still goes to container logs via the caller.
+        err = (exc.stderr or "").strip()
+        if not err and exc.stdout:
+            err = (exc.stdout or "").strip()
+        # Telegram caps outgoing text at 4096 bytes; budget for ~600 chars of
+        # ffmpeg-output plus a short prefix so the message still fits.
+        excerpt = err[:600].replace("\r\n", "\n")
+        suffix = (f"\n\nffmpeg 输出：\n{excerpt}" if excerpt else
+                  f"\n\n（未捕获到 ffmpeg 错误输出，请查看容器日志）")
+        return (
+            "无法读取或截取这个视频。"
+            f"可能是格式、远程读取或代理连接问题。{suffix}"
+        )
     return "生成失败，请查看容器日志中的错误类型。"
 
 
@@ -385,6 +436,7 @@ async def process_message(
     async with semaphore:
         preset = preferences.get(message.sender_id)
         delivery = preferences.get_delivery(message.sender_id)
+        theme = preferences.get_theme(message.sender_id)
         tmp_dir = Path(tempfile.mkdtemp(prefix="vthumb_bot_"))
         range_key: str | None = None
         progress: ProgressReporter | None = None
@@ -416,6 +468,7 @@ async def process_message(
                 cols=preset.cols,
                 width=settings.thumb_width,
                 timeout=settings.ffmpeg_timeout,
+                theme=THEME_BY_NAME[theme],
                 progress_callback=progress.report,
             )
             output_size = output.stat().st_size
@@ -434,6 +487,18 @@ async def process_message(
             if range_key:
                 exc = media_server.failure(range_key) or exc
             logging.exception("Failed to process message %s", message_id)
+            # When ffmpeg (or another subprocess) failed, log the captured stderr
+            # at WARNING level so the operator sees it in `docker logs` immediately.
+            # `logging.exception` already records the traceback, this is the
+            # *content* of the failed subprocess output (which is otherwise swallowed).
+            stderr_text = getattr(exc, "stderr", None) if isinstance(exc, subprocess.CalledProcessError) else None
+            if stderr_text:
+                logging.warning(
+                    "ffmpeg/subprocess stderr for message %s (exit=%s): %s",
+                    message_id,
+                    getattr(exc, "returncode", "?"),
+                    stderr_text,
+                )
             try:
                 error_text = "处理失败：" + user_error_message(exc)
                 if progress:
@@ -488,7 +553,7 @@ async def poll() -> None:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery):"))
+    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme):"))
     async def on_setting(event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id
         if not access.is_allowed(user_id):
@@ -500,6 +565,7 @@ async def poll() -> None:
         changed = False
         preset = preferences.get(user_id)
         delivery = preferences.get_delivery(user_id)
+        theme = preferences.get_theme(user_id)
         if event.data.startswith(b"setting:"):
             selected = setting_from_callback(event.data)
             if selected is None:
@@ -507,6 +573,13 @@ async def poll() -> None:
                 return
             changed = selected != preset
             preset = await preferences.set(user_id, selected.count, selected.cols)
+        elif event.data.startswith(b"theme:"):
+            selected_theme = theme_from_callback(event.data)
+            if selected_theme is None:
+                await event.answer("主题无效。", alert=True)
+                return
+            changed = selected_theme != theme
+            theme = await preferences.set_theme(user_id, selected_theme)
         else:
             selected_delivery = delivery_from_callback(event.data)
             if selected_delivery is None:
@@ -516,7 +589,10 @@ async def poll() -> None:
             delivery = await preferences.set_delivery(user_id, selected_delivery)
         await event.answer("设置已保存。" if changed else "当前已是这个设置。")
         if changed:
-            await event.edit(setting_text(preset, delivery), buttons=setting_buttons(preset, delivery))
+            await event.edit(
+                setting_text(preset, delivery, theme),
+                buttons=setting_buttons(preset, delivery, theme),
+            )
 
     try:
         await mt_client.start(bot_token=settings.bot_token)

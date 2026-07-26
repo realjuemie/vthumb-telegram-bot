@@ -1,10 +1,6 @@
 services:
   vthumb-bot:
-    build:
-      context: .
-      args:
-        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: vthumb-bot:fix-2026-07-25
     container_name: vthumb-bot
     restart: unless-stopped
     environment:
