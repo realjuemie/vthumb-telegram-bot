@@ -213,12 +213,13 @@ THEME_PURE_IMAGE = Theme(
     tile_ringfence=False,
     draw_header=False,  # no header block; only the N×N frame grid + timestamps
 )
-# Minimal themes: slim header/footer bands on top of the sheet.
-# The bands are NOT the same color as the sheet (would be invisible).
-# For minimal_black on a black sheet, the bands are a brighter dark gray.
-# For minimal_white on a white sheet, the bands are a light gray.
-# Bands are intentionally narrow (56px header, 44px footer) so the N×N grid
-# stays the dominant visual element.
+# Minimal themes: top + bottom bands whose fill matches the sheet color
+# exactly so the user sees a single uniform black or white surface (band
+# borders are invisible, but the band still reserves its vertical space
+# and hosts its text glyphs). Earlier versions used slightly off shades
+# (e.g. (28,28,28) on a (0,0,0) sheet) so the band was visible -- that made
+# the band look like a gray bar against the black background, which the
+# user reported as visually inconsistent with the rest of the sheet.
 THEME_MINIMAL_BLACK = Theme(
     name="minimal_black",
     sheet_bg=(0, 0, 0),
@@ -231,8 +232,8 @@ THEME_MINIMAL_BLACK = Theme(
     footer_mode="minimal",
     header_band_height=56,
     footer_band_height=44,
-    header_band_bg=(28, 28, 28),
-    footer_band_bg=(28, 28, 28),
+    header_band_bg=(0, 0, 0),
+    footer_band_bg=(0, 0, 0),
 )
 THEME_MINIMAL_WHITE = Theme(
     name="minimal_white",
@@ -246,8 +247,8 @@ THEME_MINIMAL_WHITE = Theme(
     footer_mode="minimal",
     header_band_height=56,
     footer_band_height=44,
-    header_band_bg=(238, 238, 238),
-    footer_band_bg=(238, 238, 238),
+    header_band_bg=(255, 255, 255),
+    footer_band_bg=(255, 255, 255),
 )
 THEME_BY_NAME: dict[str, Theme] = {
     t.name: t
@@ -406,11 +407,21 @@ def compose_contact_sheet(
     # Footer band height (used by the metadata band at the bottom):
     footer_height = theme.footer_band_height if theme.footer_mode != "none" else 0
 
-    # Slim top-and-bottom band cases (minimal_*): the grid is sandwiched
-    # between an explicit top band and an explicit bottom band; no extra
-    # margin padding needed beyond what those bands own.
-    if theme.header_mode == "minimal" or not theme.draw_header:
+    # Top padding: only `pure_image` (draw_header=False, header_mode !=
+    # "minimal") needs a top margin because it has neither a top band
+    # nor a header block. `minimal_*` themes have an explicit top band
+    # so they own their vertical space already; `rich` themes
+    # (potplayer / black_bg / white_bg) keep the legacy `top_padding =
+    # margin` from before the minimal mode was introduced. The user
+    # reported the resulting "all-sides white border except top" was
+    # visible only for `pure_image`, so that's the one we change.
+    if theme.header_mode == "minimal":
         top_padding = 0
+    elif not theme.draw_header:
+        # pure_image: reserve `margin` (10) at the top so frames are
+        # centered with the same visual breathing room as the left/right
+        # /bottom margins.
+        top_padding = margin
     else:
         top_padding = margin
 
