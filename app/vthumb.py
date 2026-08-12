@@ -576,74 +576,183 @@ def tuple2str(rgb: tuple[int, int, int]) -> str:
     return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
 
+# Common video file extensions we want to keep attached to the
+# previous line (don't split right before `.mp4`, `.mkv`, etc.).
+# Used by _wrap_filename_to_width to reject cut points that would
+# orphan the extension onto the next line.
+_VIDEO_EXTS = (
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts",
+    ".flv", ".wmv", ".m4v", ".mpg", ".mpeg", ".m2ts",
+    ".3gp", ".3g2", ".rm", ".rmvb", ".vob", ".mts",
+)
+# Without leading dot (used by orphan check to also match `p4` after
+# the dot has been cut off -- prevents the `m`/`p4` orphan).
+_VIDEO_EXTS_NODOT = tuple(e.lstrip(".") for e in _VIDEO_EXTS)
+
+
+def _orphans_video_ext(remaining: str, cut: int) -> bool:
+    """True if cutting at `cut` would leave only a video file
+    extension on the next line (e.g. `.mp4`, `.mkv`). The caller
+    should pick a different break point in that case.
+
+    We check both the raw rest (which may include the leading dot)
+    and the rest without the dot (in case the cut point landed
+    after the dot). Either way, the next line is just the extension.
+    """
+    rest = remaining[cut:].lstrip()
+    rest_lower = rest.lower()
+    if rest_lower.startswith(_VIDEO_EXTS):
+        return True
+    # Strip a single leading dot and check again.
+    if rest_lower.startswith("."):
+        rest_lower = rest_lower[1:]
+    return rest_lower.startswith(_VIDEO_EXTS_NODOT)
+
+
 def _wrap_filename_to_width(
     filename: str,
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     max_pixel_width: int,
 ) -> list[str]:
-    """Greedy word-preserving wrap for the filename.
+    """Wrap the filename to multiple lines, balanced around a target.
 
-    The minimal-mode header band shows the bare basename; if it's longer than
-    `max_pixel_width` it must wrap onto multiple lines. The function uses
-    Pillow's `textlength` to measure rendered width and breaks on whitespace
-    where possible; characters with no whitespace (CJK runs) get hard-broken.
-    Returns at least one line.
+    Algorithm: for each line we aim for a target of about 75% of
+    `max_pixel_width` (configurable via BAL_TARGET). The walk goes:
+
+      1. Find the largest i such that `font.getlength(remaining[:i])` fits
+         in `soft_max`. This is the upper bound on the line length.
+      2. Within the [soft_min, soft_max] window, the rightmost
+         whitespace is the preferred cut point -- it gives a balanced
+         fill (no huge right-side gap) and a word boundary.
+      3. If no whitespace in the window, hard-break at the position
+         closest to the target (BAL_TARGET) -- never at the overflow,
+         which would leave an orphan tail on the next line.
+      4. CJK runs (no whitespace) get the midpoint treatment too, so
+         long Chinese filenames are split into lines of similar width
+         rather than a single long line + a 2-char tail.
+
+    Returns at least one line. If the whole string fits in one line
+    (no wrap needed), a single-element list is returned.
     """
     if not filename:
         return [""]
 
-    # Cheap early-out: if the whole string fits, return it as one line.
+    # Cheap early-out: whole string fits in one line.
     try:
         if font.getlength(filename) <= max_pixel_width:
             return [filename]
     except AttributeError:
-        # very old Pillow fallback
         pass
+
+    BAL_TARGET = 0.75   # aim for ~75% full before breaking
+    BAL_MIN    = 0.50   # never break below this ratio (avoid orphan lines)
+    soft_max = max_pixel_width
+    soft_min = int(max_pixel_width * BAL_MIN)
+    target_w = max_pixel_width * BAL_TARGET
 
     lines: list[str] = []
     remaining = filename
     while remaining:
-        if font.getlength(remaining) <= max_pixel_width:
+        # Whole remaining fits in one line -- done.
+        if font.getlength(remaining) <= soft_max:
             lines.append(remaining)
             break
-        # Find the largest prefix that fits within max_pixel_width.
-        # Walk through characters; for whitespace, prefer to break there.
-        best_break = 0
-        best_with_ws = 0
+
+        # Single pass to find the rightmost valid break point in the
+        # [soft_min, soft_max] window. We track multiple candidates
+        # in priority order (best -> last_fitting). Each candidate is
+        # immediately filtered through `_orphans_video_ext` -- if
+        # cutting here would orphan the file extension onto the next
+        # line, we DON'T record it as a candidate. The rightmost
+        # non-orphan candidate of each kind wins.
+        last_fitting = 0
+        target_break = 0
+        best_ws = 0
+        # Track two dot-break candidates:
+        #   best_dot_keep -- cut is AT the dot, line ends in `.`
+        #   best_dot_drop -- cut is BEFORE the dot, line does NOT end in `.`
+        # We prefer best_dot_drop when picking a cut, to avoid the ugly
+        # "trailing dot at end of line" pattern.
+        best_dot_keep = 0
+        best_dot_drop = 0
         for i in range(1, len(remaining) + 1):
             chunk = remaining[:i]
             w = font.getlength(chunk)
-            if w > max_pixel_width:
+            if w > soft_max:
                 break
-            best_break = i
-            # Prefer break right after a whitespace character (preserves words)
-            if remaining[i - 1].isspace() if i < len(remaining) else False:
-                best_with_ws = i
-        # Use word-boundary break if available; otherwise hard-break at best_break.
-        cut = best_with_ws if best_with_ws > 0 else best_break
-        if cut <= 0:
-            # pathological: a single character is wider than max_pixel_width.
-            # emit it as a single-character line so we make progress.
-            cut = 1
-        lines.append(remaining[:cut].rstrip())
+            last_fitting = i
+            if w <= target_w:
+                target_break = i
+            if w >= soft_min and i < len(remaining):
+                ch = remaining[i - 1]
+                # Skip any break that would orphan the extension.
+                if _orphans_video_ext(remaining, i):
+                    continue
+                if ch.isspace():
+                    best_ws = i  # rightmost wins
+                elif ch == ".":
+                    best_dot_keep = i  # cut AT the dot, line ends in `.`
+                    # Also record the drop variant: cut BEFORE the dot,
+                    # so the line does NOT end in `.`. The next line
+                    # starts with `.` which is the extension prefix or a
+                    # mid-string separator.
+                    if not _orphans_video_ext(remaining, i + 1):
+                        best_dot_drop = i + 1
+
+        # Decision priority: whitespace > dot-without-trailing-dot >
+        # hard-break at target > last_fitting. We strongly prefer
+        # `best_dot_drop` over `best_dot_keep` so the line does not
+        # end in a dangling dot. The drop variant places the dot at
+        # the START of the next line, which is visually less awkward.
+        chosen_cut = (
+            best_ws
+            or best_dot_drop
+            or best_dot_keep
+            or target_break
+            or last_fitting
+        )
+        # If last_fitting itself orphans (pathological: the only thing
+        # that fits past soft_min is the extension), try the next-lower
+        # position one char at a time.
+        while chosen_cut > 0 and _orphans_video_ext(remaining, chosen_cut):
+            chosen_cut -= 1
+        cut = chosen_cut if chosen_cut > 0 else 1
+
+        cut = chosen_cut if chosen_cut > 0 else 1
         # Skip leading whitespace on the next line for cleanliness
+        line = remaining[:cut].rstrip()
+        if line:
+            lines.append(line)
         remaining = remaining[cut:].lstrip()
-        # Safety: avoid infinite loops if remaining is non-empty but cut was 0
         if not remaining:
             break
 
     return lines
 
 
+
 def build_header_lines(source: SourceInfo, meta: MediaInfo, max_chars: int) -> list[str]:
+    # Build the multi-line header for rich-mode themes (potplayer /
+    # black_bg / white_bg). Uses _wrap_filename_to_width for the
+    # filename split so we get pixel-accurate, balanced wrap with
+    # extension preservation -- not the brittle char-counting split
+    # that produced the .m / p4 orphan.
     prefix = "文件名: "
-    name = source.filename
-    file_lines = []
-    while len(name) > max_chars:
-        file_lines.append(prefix + name[:max_chars])
-        prefix = ""
-        name = name[max_chars:]
-    file_lines.append(prefix + name)
+    name = source.filename or ""
+    sheet_width = 1920
+    header_font_size = max(18, round(sheet_width / 52))
+    char_w = header_font_size * 1.1
+    available_chars = max(20, max_chars)
+    max_pixel_width = int(available_chars * char_w)
+    font = load_font(header_font_size, bold=True)
+    # Wrap using the same algorithm as minimal mode.
+    wrapped = _wrap_filename_to_width(name, font, max_pixel_width)
+    if not wrapped:
+        file_lines = [prefix + name]
+    else:
+        file_lines = [prefix + wrapped[0]]
+        for cont in wrapped[1:]:
+            file_lines.append(cont)
 
     return file_lines + [
         f"大小: {format_size(source.size)}",

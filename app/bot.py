@@ -40,7 +40,15 @@ BOT_COMMANDS = (
     ("add", "管理员：添加授权用户"),
     ("del", "管理员：删除授权用户"),
     ("users", "管理员：查看授权用户"),
+    ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
 )
+
+# ── /merge feature constants ─────────────────────────────────────────
+MERGE_DEFAULT_COUNT = 2          # bare /merge picks this many
+MERGE_MAX_COUNT     = 20         # Telegram media_group caps at 10 per batch
+MERGE_MIN_COUNT     = 1
+MERGE_DEBOUNCE_SEC  = 5.0        # wait this long after last media before firing
+MERGE_LOG_PREFIX    = "[merge]"
 SUPPORTED_EXTENSIONS = {
     ".3g2",
     ".3gp",
@@ -274,10 +282,328 @@ async def handle_command(
             else:
                 removed = await access.remove(target_id)
                 text = f"已删除用户：{target_id}" if removed else f"用户不在授权名单中：{target_id}"
+    elif command == "merge":
+        # /merge [N | cancel | status]
+        await _merge_handle(client, settings, access, preferences, message)
+        return True
     else:
         text = "未知命令，请使用 /help 查看可用命令。"
     await client.send_message(message.chat_id, text, reply_to=message.id, buttons=buttons)
     return True
+
+
+async def _merge_handle(
+    client: TelegramClient,
+    settings: Settings,
+    access: AccessControl,
+    preferences: UserPreferences,
+    message: Any,
+) -> None:
+    """Parse /merge [N | cancel | status]. All sub-commands in one
+    handler to keep state co-located. Called from handle_command."""
+    user_id = message.sender_id
+    # Allow any authorized user + admin to use /merge. (Same gate as
+    # /add etc. is admin-only; /merge is general utility.)
+    if not access.is_allowed(user_id) and not access.is_admin(user_id):
+        await client.send_message(
+            message.chat_id,
+            permission_message(user_id),
+            reply_to=message.id,
+        )
+        return
+    raw = (message.raw_text or "").split()
+    arg = raw[1].lower() if len(raw) > 1 else ""
+
+    # ── cancel ──
+    if arg == "cancel":
+        state = _pending_merge.pop(user_id, None)
+        if state is None:
+            return await client.send_message(
+                message.chat_id, "ℹ️ 没有等待中的合并任务。", reply_to=message.id,
+            )
+        if state["task"] and not state["task"].done():
+            state["task"].cancel()
+        return await client.send_message(
+            message.chat_id, "✓ 已取消当前合并任务。", reply_to=message.id,
+        )
+
+    # ── status ──
+    if arg == "status":
+        state = _pending_merge.get(user_id)
+        if not state:
+            return await client.send_message(
+                message.chat_id, "ℹ️ 当前没有等待中的合并任务。", reply_to=message.id,
+            )
+        remain = state["expected_count"] - state["received_count"]
+        return await client.send_message(
+            message.chat_id,
+            f"⏱ {state['received_count']}/{state['expected_count']} 已收, 还差 {remain} 条。\n"
+            f"5 秒静默后开始合并。\n"
+            f"取消: /merge cancel",
+            reply_to=message.id,
+        )
+
+    # ── set N (or default) ──
+    if user_id in _pending_merge:
+        return await client.send_message(
+            message.chat_id,
+            "⚠️ 你已经有等待中的合并任务。\n"
+            "先发完或发送 /merge cancel 取消。",
+            reply_to=message.id,
+        )
+    if arg == "":
+        n = MERGE_DEFAULT_COUNT
+    else:
+        try:
+            n = int(arg)
+        except ValueError:
+            return await client.send_message(
+                message.chat_id,
+                f"✗ 用法: /merge [N | cancel | status]\n"
+                f"  N 范围: {MERGE_MIN_COUNT}-{MERGE_MAX_COUNT}。",
+                reply_to=message.id,
+            )
+        if n < MERGE_MIN_COUNT or n > MERGE_MAX_COUNT:
+            return await client.send_message(
+                message.chat_id,
+                f"✗ N 必须是 {MERGE_MIN_COUNT}-{MERGE_MAX_COUNT} 之间的整数。",
+                reply_to=message.id,
+            )
+
+    state = {
+        "user_id": user_id,
+        "chat_id": message.chat_id,
+        "expected_count": n,
+        "collected": [],
+        "task": None,
+        "started_at": asyncio.get_event_loop().time(),
+        "notify_msg_id": None,
+    }
+    _pending_merge[user_id] = state
+
+    notify = await client.send_message(
+        message.chat_id,
+        f"✓ 模式开启, 等待接下来 {n} 条媒体消息。\n"
+        f"  支持: 图片 / 视频 / 动图 / 圆视频。\n"
+        f"  图片会排在前, 视频排在后, 自带的说明文字会被去除。\n"
+        f"  5 秒静默后开始合并。\n"
+        f"  取消: /merge cancel",
+        reply_to=message.id,
+    )
+    state["notify_msg_id"] = notify.id
+
+
+async def _merge_collect_media(
+    client: TelegramClient,
+    settings: Settings,
+    access: AccessControl,
+    preferences: UserPreferences,
+    message: Any,
+) -> bool:
+    """Called from on_message after handle_command returns False. If
+    this user has an active merge session AND the message contains
+    media, count it toward the session and return True (so the
+    caller skips process_message).
+
+    Returns False if no merge is active OR the message has no media.
+    """
+    user_id = message.sender_id
+    state = _pending_merge.get(user_id)
+    if not state:
+        return False  # no merge active; let the normal flow continue
+
+    # Identify media type from Telethon message attributes.
+    kind = _merge_classify(message)
+    if not kind:
+        return False  # not media; let normal flow continue (text/etc.)
+    state["collected"].append(message)
+
+    recv = len(state["collected"])
+    expected = state["expected_count"]
+    logging.info(
+        f"{MERGE_LOG_PREFIX} uid={user_id} got media {recv}/{expected} (kind={kind})"
+    )
+
+    if recv < expected:
+        # Still collecting -- restart the debounce, ask for the next one.
+        _merge_schedule_debounce(
+            state,
+            lambda: _merge_fire(client, state, user_id),
+        )
+        await client.send_message(
+            message.chat_id,
+            f"⏱ {recv}/{expected}, 等待第 {recv + 1} 条...",
+            reply_to=message.id,
+        )
+        return True
+
+    # Got all N -- finalization debounce.
+    _merge_schedule_debounce(
+        state,
+        lambda: _merge_fire(client, state, user_id),
+    )
+    await client.send_message(
+        message.chat_id,
+        f"⏱ {recv}/{expected}, 5 秒后开始合并...",
+        reply_to=message.id,
+    )
+    return True
+
+
+def _merge_classify(message: Any) -> str:
+    """Return 'photo', 'animation', 'video', 'video_note', or ''."""
+    if getattr(message, "video", None):
+        return "video"
+    if getattr(message, "video_note", None):
+        return "video_note"
+    if getattr(message, "animation", None):
+        return "animation"
+    if getattr(message, "photo", None):
+        return "photo"
+    return ""
+
+
+def _merge_schedule_debounce(state: dict, on_fire) -> None:
+    """Cancel any previous timer, schedule a new 5-second one."""
+    if state.get("task") and not state["task"].done():
+        state["task"].cancel()
+    async def _wait():
+        try:
+            await asyncio.sleep(MERGE_DEBOUNCE_SEC)
+        except asyncio.CancelledError:
+            return
+        try:
+            await on_fire()
+        except Exception as e:
+            logging.exception(f"{MERGE_LOG_PREFIX} debounce fire failed: {e}")
+    state["task"] = asyncio.create_task(_wait())
+
+
+async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None:
+    """Debounce fired -- finalize this user's pending merge."""
+    # Pop the state atomically so concurrent /merge can't see it.
+    current = _pending_merge.pop(user_id, None)
+    if current is None:
+        return  # already cancelled
+    state = current  # use the popped state
+
+    chat_id = state["chat_id"]
+    msgs = state["collected"]
+    photos = [m for m in msgs if _merge_classify(m) in ("photo", "animation")]
+    videos = [m for m in msgs if _merge_classify(m) in ("video", "video_note")]
+
+    # Build Telethon InputMedia objects, photos first, videos last,
+    # using only file_id references -- no downloads, no disk I/O.
+    #
+    # Telethon 1.40 doesn't export `InputMediaVideo` in `telethon.tl.types`
+    # -- `Message.video` is a `Document`, and we send it as
+    # `InputMediaDocument` which Telethon will render as a video in
+    # a media_group (the `video_cover` and `video_timestamp` params
+    # are only needed for round video_notes).
+    #
+    # `InputMediaPhoto` and `InputMediaDocument` constructors accept
+    # `Input*` TL types (id/access_hash/file_reference). `Message.photo`
+    # is a `Photo` and `Message.video` is a `Document` -- distinct from
+    # the Input* types. We re-wrap them into the Input* form.
+    #
+    # Caption stripping is automatic: when we re-wrap from a Photo/
+    # Document, we don't carry over the original message's text
+    # caption -- Telegram renders the album without any text.
+    from telethon.tl.types import (
+        InputMediaPhoto,
+        InputMediaDocument,
+        InputPhoto,
+        InputDocument,
+    )
+    media: list = []
+    for m in photos:
+        if _merge_classify(m) == "photo":
+            ph = m.photo
+            input_photo = InputPhoto(ph.id, ph.access_hash, ph.file_reference)
+            media.append(InputMediaPhoto(input_photo))
+        else:  # animation
+            doc = m.animation
+            input_doc = InputDocument(doc.id, doc.access_hash, doc.file_reference)
+            media.append(InputMediaDocument(input_doc))
+    for m in videos:
+        if _merge_classify(m) == "video":
+            doc = m.video
+            input_doc = InputDocument(doc.id, doc.access_hash, doc.file_reference)
+            media.append(InputMediaDocument(input_doc))
+        else:  # video_note
+            doc = m.video_note
+            input_doc = InputDocument(doc.id, doc.access_hash, doc.file_reference)
+            media.append(InputMediaDocument(input_doc))
+
+    if not media:
+        await client.send_message(
+            chat_id,
+            "✗ 没有可合并的媒体 (全部 file_id 缺失)。请重新 /merge。",
+        )
+        return
+
+    logging.info(
+        f"{MERGE_LOG_PREFIX} uid={user_id} firing: "
+        f"{len(photos)} photo/animation + {len(videos)} video = {len(media)} items"
+    )
+
+    # Telegram caps media_group at 10 items; chunk if needed.
+    BATCH = 10
+    sent = 0
+    failed_indices: list[int] = []
+    for batch_start in range(0, len(media), BATCH):
+        batch = media[batch_start:batch_start + BATCH]
+        try:
+            await client.send_file(
+                chat_id,
+                batch,
+                force_document=False,
+            )
+            sent += len(batch)
+        except Exception as e:
+            err = str(e).lower()
+            logging.warning(f"{MERGE_LOG_PREFIX} uid={user_id} batch failed: {e}")
+            if any(tok in err for tok in (
+                "file_id_invalid", "media_invalid", "file reference",
+                "invalid file", "wrong file id", "media_empty",
+                "400 bad_request",
+            )):
+                for i in range(len(batch)):
+                    failed_indices.append(batch_start + i + 1)
+            else:
+                await client.send_message(
+                    chat_id,
+                    f"⚠️ 第 {batch_start + 1}-{batch_start + len(batch)} 条合并失败: {e}",
+                )
+                continue
+
+    summary = [f"✓ 已合并 {state['expected_count']} 条 ({len(photos)} 图 + {len(videos)} 视频)"]
+    if sent:
+        summary.append(f"  成功发送 {sent}/{len(media)} 条")
+    if failed_indices:
+        idx_list = ", ".join(str(i) for i in failed_indices)
+        summary.append("")
+        summary.append(f"✗ 第 {idx_list} 条 file_id 已失效 (Telegram 缓存已清理)。")
+        summary.append("  请在 Telegram 长按原消息 → 引用回复 → 把那条转发给我。")
+        summary.append("  然后重新发送 /merge 即可。")
+    try:
+        await client.send_message(chat_id, "\n".join(summary))
+    except Exception:
+        pass
+
+    # Best-effort: delete the original "OK waiting" reply so the chat
+    # is tidy.
+    notify_id = state.get("notify_msg_id")
+    if notify_id is not None:
+        try:
+            await client.delete_messages(chat_id, [notify_id])
+        except Exception:
+            pass
+
+
+# Module-level merge state. One pending merge per user at a time.
+# Dict keyed by sender_id, value is a dict (see _merge_handle).
+_pending_merge: dict[int, dict] = {}
 
 
 async def set_bot_commands(client: TelegramClient) -> None:
@@ -539,6 +865,12 @@ async def poll() -> None:
     @mt_client.on(events.NewMessage(incoming=True))
     async def on_message(event: events.NewMessage.Event) -> None:
         if await handle_command(mt_client, settings, access, preferences, event.message):
+            return
+        # /merge short-circuit: if a merge session is active for this
+        # sender, collect the media and DO NOT process_message() it.
+        if await _merge_collect_media(
+            mt_client, settings, access, preferences, event.message
+        ):
             return
         if not access.is_allowed(event.sender_id):
             await mt_client.send_message(
