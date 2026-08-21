@@ -1,12 +1,16 @@
+import asyncio
 import unittest
 
 from app.bot import (
     BOT_COMMANDS,
+    JobQueue,
     command_name,
     command_user_id,
     delivery_from_callback,
     format_progress,
+    format_queue_status,
     setting_from_callback,
+    short_filename,
 )
 
 
@@ -50,6 +54,54 @@ class BotCommandTests(unittest.TestCase):
 
     def test_delivery_callback_rejects_unknown_mode(self) -> None:
         self.assertIsNone(delivery_from_callback(b"delivery:other"))
+
+    def test_queue_status_shows_ahead_count(self) -> None:
+        text = format_queue_status(2, "clip.mp4")
+        self.assertIn("2", text)
+        self.assertIn("clip.mp4", text)
+        self.assertIn("队列", text)
+
+    def test_queue_status_ready_when_ahead_zero(self) -> None:
+        self.assertEqual(format_queue_status(0, "a.mp4"), "轮到你了，开始处理。")
+
+    def test_short_filename_truncates(self) -> None:
+        long_name = "a" * 90 + ".mp4"
+        self.assertTrue(short_filename(long_name).endswith("..."))
+        self.assertLessEqual(len(short_filename(long_name)), 80)
+
+
+class _DummyClient:
+    def __init__(self) -> None:
+        self.sends: list[str] = []
+        self._n = 0
+
+    async def send_message(self, chat_id, text, reply_to=None):
+        self._n += 1
+        self.sends.append(text)
+        return type("Msg", (), {"id": self._n})()
+
+    async def edit_message(self, chat_id, message_id, text):
+        return None
+
+
+class JobQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fifo_order_and_queue_notice(self) -> None:
+        queue = JobQueue(1)
+        client = _DummyClient()
+        started: list[str] = []
+
+        async def job(name: str) -> None:
+            await queue.join(client, 1, 1, name)
+            started.append(name)
+            await asyncio.sleep(0.05)
+            await queue.leave()
+
+        first = asyncio.create_task(job("one.mp4"))
+        await asyncio.sleep(0.01)
+        second = asyncio.create_task(job("two.mp4"))
+        await asyncio.gather(first, second)
+        self.assertEqual(started, ["one.mp4", "two.mp4"])
+        self.assertTrue(any("two.mp4" in text for text in client.sends))
 
 
 if __name__ == "__main__":

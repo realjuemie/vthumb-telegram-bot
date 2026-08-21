@@ -202,6 +202,7 @@ async def handle_command(
     access: AccessControl,
     preferences: UserPreferences,
     message: Any,
+    queue: "JobQueue | None" = None,
 ) -> bool:
     command = command_name(message.raw_text)
     if command is None:
@@ -232,7 +233,8 @@ async def handle_command(
                 f"4. 大视频初始读取预算 {settings.max_source_fetch_ratio:.0%}，"
                 f"按需提升至 {settings.hard_source_fetch_ratio:.0%}，"
                 f"且不超过 {settings.max_source_fetch_mb}MB。\n"
-                "5. 已读取分块会临时缓存，任务结束后自动删除。"
+                "5. 已读取分块会临时缓存，任务结束后自动删除。\n"
+                "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。"
             )
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
@@ -252,7 +254,10 @@ async def handle_command(
                 f"小文件阈值：{settings.small_file_full_read_mb}MB\n"
                 f"大视频预算：初始 {settings.max_source_fetch_ratio:.0%}，"
                 f"按需至 {settings.hard_source_fetch_ratio:.0%}，"
-                f"最高 {settings.max_source_fetch_mb}MB"
+                f"最高 {settings.max_source_fetch_mb}MB\n"
+                f"任务队列：处理中 {queue.running if queue else 0}，"
+                f"排队 {queue.waiting if queue else 0}"
+                f"（并发 {queue.concurrency if queue else settings.max_concurrent_jobs}）"
             )
     elif command == "setting":
         if not is_allowed:
@@ -653,6 +658,111 @@ def format_progress(stage: str, current: int, total: int) -> str:
     return f"{label}{detail}\n[{bar}] {percent}%"
 
 
+def short_filename(name: str) -> str:
+    name = (name or "video").strip() or "video"
+    return name[:77] + "..." if len(name) > 80 else name
+
+
+def format_queue_status(ahead: int, filename: str) -> str:
+    name = short_filename(filename)
+    if ahead <= 0:
+        return "轮到你了，开始处理。"
+    return (
+        f"⏳ 已加入队列，按到达顺序处理。\n"
+        f"前面还有 {ahead} 个任务\n"
+        f"文件：{name}\n"
+        f"请稍候，轮到时会自动开始。"
+    )
+
+
+class QueueTicket:
+    __slots__ = ("client", "chat_id", "filename", "status_id")
+
+    def __init__(self, client: TelegramClient, chat_id: int, filename: str) -> None:
+        self.client = client
+        self.chat_id = chat_id
+        self.filename = filename
+        self.status_id: int | None = None
+
+
+class JobQueue:
+    """FIFO 任务队列。并发由 semaphore 限制，排队位置会写回 Telegram 消息。"""
+
+    def __init__(self, concurrency: int) -> None:
+        self.concurrency = max(1, concurrency)
+        self._sema = asyncio.Semaphore(self.concurrency)
+        self._lock = asyncio.Lock()
+        self._waiters: list[QueueTicket] = []
+        self._running = 0
+
+    @property
+    def running(self) -> int:
+        return self._running
+
+    @property
+    def waiting(self) -> int:
+        return len(self._waiters)
+
+    async def join(
+        self,
+        client: TelegramClient,
+        chat_id: int,
+        reply_to: int,
+        filename: str,
+    ) -> QueueTicket:
+        ticket = QueueTicket(client, chat_id, filename)
+        async with self._lock:
+            ahead = self._running + len(self._waiters)
+            self._waiters.append(ticket)
+        try:
+            if ahead > 0:
+                try:
+                    msg = await client.send_message(
+                        chat_id,
+                        format_queue_status(ahead, filename),
+                        reply_to=reply_to,
+                    )
+                    ticket.status_id = msg.id
+                except Exception as exc:
+                    logging.warning("Could not send queue message (%s)", type(exc).__name__)
+            await self._sema.acquire()
+        except BaseException:
+            async with self._lock:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+            raise
+        async with self._lock:
+            if ticket in self._waiters:
+                self._waiters.remove(ticket)
+            self._running += 1
+            snapshot = list(self._waiters)
+            running = self._running
+        await self._notify_waiters(snapshot, running)
+        return ticket
+
+    async def leave(self) -> None:
+        async with self._lock:
+            self._running = max(0, self._running - 1)
+            snapshot = list(self._waiters)
+            running = self._running
+        self._sema.release()
+        await self._notify_waiters(snapshot, running)
+
+    async def _notify_waiters(self, waiters: list[QueueTicket], running: int) -> None:
+        for index, ticket in enumerate(waiters):
+            if ticket.status_id is None:
+                continue
+            ahead = index + running
+            try:
+                await ticket.client.edit_message(
+                    ticket.chat_id,
+                    ticket.status_id,
+                    format_queue_status(ahead, ticket.filename),
+                )
+            except Exception as exc:
+                logging.warning("Could not update queue message (%s)", type(exc).__name__)
+
+
 class ProgressReporter:
     def __init__(self, client: TelegramClient, chat_id: int, message_id: int) -> None:
         self.client = client
@@ -665,10 +775,21 @@ class ProgressReporter:
         self.task = asyncio.create_task(self._run())
 
     @classmethod
-    async def create(cls, client: TelegramClient, chat_id: int, reply_to: int) -> "ProgressReporter":
+    async def create(
+        cls,
+        client: TelegramClient,
+        chat_id: int,
+        reply_to: int,
+        existing_id: int | None = None,
+    ) -> "ProgressReporter":
+        start_text = "收到，准备按需读取视频分块。大视频不会预先完整下载。"
+        if existing_id is not None:
+            reporter = cls(client, chat_id, existing_id)
+            await reporter._edit(start_text)
+            return reporter
         message = await client.send_message(
             chat_id,
-            "收到，准备按需读取视频分块。大视频不会预先完整下载。",
+            start_text,
             reply_to=reply_to,
         )
         return cls(client, chat_id, message.id)
@@ -749,7 +870,7 @@ async def process_message(
     media_server: MTProtoRangeServer,
     settings: Settings,
     preferences: UserPreferences,
-    semaphore: asyncio.Semaphore,
+    queue: JobQueue,
     message: Any,
 ) -> None:
     chat_id = message.chat_id
@@ -759,7 +880,9 @@ async def process_message(
         await client.send_message(chat_id, "请发送视频文件，或把视频作为 document 发送给我。", reply_to=message_id)
         return
 
-    async with semaphore:
+    filename = video.get("file_name") or "telegram-video.mp4"
+    ticket = await queue.join(client, chat_id, message_id, Path(filename).name)
+    try:
         preset = preferences.get(message.sender_id)
         delivery = preferences.get_delivery(message.sender_id)
         theme = preferences.get_theme(message.sender_id)
@@ -767,7 +890,9 @@ async def process_message(
         range_key: str | None = None
         progress: ProgressReporter | None = None
         try:
-            progress = await ProgressReporter.create(client, chat_id, message_id)
+            progress = await ProgressReporter.create(
+                client, chat_id, message_id, existing_id=ticket.status_id
+            )
             file_size = video.get("file_size")
             if not isinstance(file_size, int) or file_size <= 0:
                 raise RuntimeError("Telegram did not provide the video file size.")
@@ -841,6 +966,8 @@ async def process_message(
             if range_key:
                 media_server.unregister(range_key)
             shutil.rmtree(tmp_dir, ignore_errors=True)
+    finally:
+        await queue.leave()
 
 
 async def poll() -> None:
@@ -859,12 +986,12 @@ async def poll() -> None:
         mt_client,
         cache_bytes=settings.range_cache_mb * 1024 * 1024,
     )
-    semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
+    queue = JobQueue(settings.max_concurrent_jobs)
     tasks: set[asyncio.Task[None]] = set()
 
     @mt_client.on(events.NewMessage(incoming=True))
     async def on_message(event: events.NewMessage.Event) -> None:
-        if await handle_command(mt_client, settings, access, preferences, event.message):
+        if await handle_command(mt_client, settings, access, preferences, event.message, queue=queue):
             return
         # /merge short-circuit: if a merge session is active for this
         # sender, collect the media and DO NOT process_message() it.
@@ -880,7 +1007,7 @@ async def poll() -> None:
             )
             return
         task = asyncio.create_task(
-            process_message(mt_client, media_server, settings, preferences, semaphore, event.message)
+            process_message(mt_client, media_server, settings, preferences, queue, event.message)
         )
         tasks.add(task)
         task.add_done_callback(tasks.discard)

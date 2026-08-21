@@ -1,6 +1,6 @@
 services:
   vthumb-bot:
-    image: vthumb-bot:fix-2026-08-11
+    image: vthumb-bot:fix-2026-08-22
     container_name: vthumb-bot
     restart: unless-stopped
     environment:
