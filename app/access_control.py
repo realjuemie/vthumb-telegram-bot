@@ -4,11 +4,12 @@ from pathlib import Path
 
 
 class AccessControl:
-    def __init__(self, path: Path, admin_ids: frozenset[int]) -> None:
+    def __init__(self, path: Path, admin_ids: frozenset[int], open_access: bool = False) -> None:
         if not admin_ids:
             raise RuntimeError("At least one ADMIN_IDS entry is required.")
         self.path = path
         self.admin_ids = admin_ids
+        self.open_access = open_access
         self.user_ids = self._load()
         self.lock = asyncio.Lock()
 
@@ -26,7 +27,11 @@ class AccessControl:
         return user_id is not None and user_id in self.admin_ids
 
     def is_allowed(self, user_id: int | None) -> bool:
-        return self.is_admin(user_id) or (user_id is not None and user_id in self.user_ids)
+        if user_id is None:
+            return False
+        if self.open_access:
+            return True
+        return self.is_admin(user_id) or user_id in self.user_ids
 
     def users(self) -> list[int]:
         return sorted(self.user_ids)

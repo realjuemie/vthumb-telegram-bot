@@ -17,6 +17,13 @@ def _float_env(name: str, default: float) -> float:
     return float(value)
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _int_set_env(name: str) -> frozenset[int]:
     values = os.getenv(name, "")
     return frozenset(int(value.strip()) for value in values.split(",") if value.strip())
@@ -39,6 +46,7 @@ class Settings:
     source_fetch_growth_mb: int
     mt_proxy_url: str | None
     admin_ids: frozenset[int]
+    open_access: bool
     access_file: str
     preferences_file: str
 
@@ -101,6 +109,7 @@ class Settings:
             source_fetch_growth_mb=_int_env("SOURCE_FETCH_GROWTH_MB", 16),
             mt_proxy_url=os.getenv("MT_PROXY_URL") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"),
             admin_ids=_int_set_env("ADMIN_IDS"),
+            open_access=_bool_env("OPEN_ACCESS", False),
             access_file=os.getenv("ACCESS_FILE", "/data/access.json"),
             preferences_file=os.getenv("PREFERENCES_FILE", "/data/preferences.json"),
         )

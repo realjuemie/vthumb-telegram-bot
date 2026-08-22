@@ -9,6 +9,7 @@ from app.bot import (
     delivery_from_callback,
     format_progress,
     format_queue_status,
+    format_user_label,
     setting_from_callback,
     short_filename,
 )
@@ -25,6 +26,7 @@ class BotCommandTests(unittest.TestCase):
         names = [name for name, _ in BOT_COMMANDS]
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(name.isascii() and name.islower() for name in names))
+        self.assertNotIn("forward", names)
 
     def test_extracts_add_user_id(self) -> None:
         self.assertEqual(command_user_id("/add 123456789"), 123456789)
@@ -102,6 +104,16 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(first, second)
         self.assertEqual(started, ["one.mp4", "two.mp4"])
         self.assertTrue(any("two.mp4" in text for text in client.sends))
+
+    def test_forward_command_parses(self) -> None:
+        self.assertEqual(command_name("/forward on"), "forward")
+
+    def test_user_label_prefers_username(self) -> None:
+        sender = type("U", (), {"username": "alice", "first_name": "A"})()
+        self.assertEqual(format_user_label(sender, 1), "@alice")
+
+    def test_user_label_falls_back_to_id(self) -> None:
+        self.assertEqual(format_user_label(None, 42), "42")
 
 
 if __name__ == "__main__":

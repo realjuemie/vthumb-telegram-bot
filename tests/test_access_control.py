@@ -31,6 +31,17 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await access.remove(123456789))
             self.assertTrue(access.is_allowed(123456789))
 
+    async def test_open_access_allows_anyone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            access = AccessControl(
+                Path(directory) / "access.json",
+                frozenset({123456789}),
+                open_access=True,
+            )
+            self.assertTrue(access.is_allowed(111))
+            self.assertTrue(access.is_allowed(123456789))
+            self.assertFalse(access.is_allowed(None))
+
 
 if __name__ == "__main__":
     unittest.main()
