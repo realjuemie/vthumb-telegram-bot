@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import shutil
@@ -662,6 +663,17 @@ def format_user_label(sender: Any, user_id: int | None) -> str:
     return str(user_id or "未知")
 
 
+def format_forward_notice(label: str, user_id: int | None, count: int) -> str:
+    safe = html.escape(label or str(user_id or "未知"), quote=True)
+    if user_id:
+        return (
+            f"用户 {safe} "
+            f'(<a href="tg://user?id={int(user_id)}">{int(user_id)}</a>) '
+            f"完成 {count} 个任务"
+        )
+    return f"用户 {safe} 完成 {count} 个任务"
+
+
 _pending_forward: dict[int, dict] = {}
 
 
@@ -746,7 +758,7 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
     items = state["items"]
     label = state.get("label") or str(user_id)
     count = len(items)
-    notice = f"用户 {label} 完成 {count} 个任务"
+    notice = format_forward_notice(label, user_id, count)
     pngs = [item["png"] for item in items if item.get("png") and Path(item["png"]).exists()]
     videos = [item["message"] for item in items if item.get("message") is not None]
     from telethon.tl.types import InputMediaDocument, InputDocument
@@ -769,7 +781,7 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
 
     for admin_id in sorted(access.admin_ids):
         try:
-            await client.send_message(admin_id, notice)
+            await client.send_message(admin_id, notice, parse_mode="html")
         except Exception as exc:
             logging.warning("%s notify admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, type(exc).__name__)
             continue

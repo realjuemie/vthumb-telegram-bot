@@ -7,6 +7,7 @@ from app.bot import (
     command_name,
     command_user_id,
     delivery_from_callback,
+    format_forward_notice,
     format_progress,
     format_queue_status,
     format_user_label,
@@ -114,6 +115,12 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
 
     def test_user_label_falls_back_to_id(self) -> None:
         self.assertEqual(format_user_label(None, 42), "42")
+
+    def test_forward_notice_id_is_profile_link(self) -> None:
+        text = format_forward_notice("@alice", 99, 2)
+        self.assertIn("tg://user?id=99", text)
+        self.assertIn(">99</a>", text)
+        self.assertIn("完成 2 个任务", text)
 
 
 if __name__ == "__main__":
