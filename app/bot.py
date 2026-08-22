@@ -3,9 +3,11 @@ import contextlib
 import html
 import json
 import logging
+import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -803,6 +805,103 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+_pack_offers: dict[str, dict] = {}
+PACK_OFFER_TTL_SEC = 3600
+
+
+def _message_to_input_media(message: Any):
+    from telethon.tl.types import InputDocument, InputMediaDocument, InputMediaPhoto, InputPhoto
+    if getattr(message, "photo", None):
+        ph = message.photo
+        return InputMediaPhoto(InputPhoto(ph.id, ph.access_hash, ph.file_reference))
+    doc = (
+        getattr(message, "document", None)
+        or getattr(message, "video", None)
+        or getattr(message, "video_note", None)
+        or getattr(message, "animation", None)
+    )
+    if doc is None:
+        return None
+    return InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference))
+
+
+def _purge_pack_offers() -> None:
+    now = time.time()
+    expired = [key for key, item in _pack_offers.items() if item.get("expires", 0) < now]
+    for key in expired:
+        _pack_offers.pop(key, None)
+
+
+async def _offer_pack_forward(client: TelegramClient, source_msg: Any, result_msg: Any) -> None:
+    if result_msg is None or source_msg is None:
+        return
+    _purge_pack_offers()
+    token = secrets.token_hex(4)
+    _pack_offers[token] = {
+        "user_id": source_msg.sender_id,
+        "chat_id": source_msg.chat_id,
+        "source": source_msg,
+        "result": result_msg,
+        "expires": time.time() + PACK_OFFER_TTL_SEC,
+    }
+    await client.send_message(
+        source_msg.chat_id,
+        "要不要把缩略图和原视频合并成一条消息，方便转发？",
+        buttons=[
+            [
+                Button.inline("合并为一条", f"pack:y:{token}".encode()),
+                Button.inline("不用了", f"pack:n:{token}".encode()),
+            ]
+        ],
+        reply_to=getattr(result_msg, "id", None),
+    )
+
+
+async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
+    raw = (event.data or b"").decode("utf-8", "replace")
+    parts = raw.split(":")
+    if len(parts) != 3 or parts[0] != "pack" or parts[1] not in {"y", "n"}:
+        await event.answer("按钮已失效。", alert=True)
+        return
+    action, token = parts[1], parts[2]
+    offer = _pack_offers.get(token)
+    if offer is None or offer.get("expires", 0) < time.time():
+        _pack_offers.pop(token, None)
+        await event.answer("这条询问已过期。", alert=True)
+        with contextlib.suppress(Exception):
+            await event.edit("这条合并询问已过期。")
+        return
+    if event.sender_id != offer["user_id"]:
+        await event.answer("这不是你的任务。", alert=True)
+        return
+    if action == "n":
+        _pack_offers.pop(token, None)
+        await event.answer("好的")
+        with contextlib.suppress(Exception):
+            await event.edit("好的，保持分开发送。")
+        return
+    sheet = _message_to_input_media(offer["result"])
+    video = _message_to_input_media(offer["source"])
+    if sheet is None or video is None:
+        await event.answer("找不到可合并的媒体。", alert=True)
+        return
+    try:
+        await event.client.send_file(
+            offer["chat_id"],
+            [sheet, video],
+            force_document=False,
+            reply_to=offer["source"].id,
+        )
+    except Exception as exc:
+        logging.warning("pack-forward album failed: %s", exc)
+        await event.answer("合并发送失败，请稍后重试。", alert=True)
+        return
+    _pack_offers.pop(token, None)
+    await event.answer("已合并")
+    with contextlib.suppress(Exception):
+        await event.edit("已合并为一条消息，可长按转发。")
+
+
 # Module-level merge state. One pending merge per user at a time.
 # Dict keyed by sender_id, value is a dict (see _merge_handle).
 _pending_merge: dict[int, dict] = {}
@@ -1123,7 +1222,7 @@ async def process_message(
             )
             output_size = output.stat().st_size
             await progress.show_now("upload", 0, output_size)
-            await client.send_file(
+            sent = await client.send_file(
                 chat_id,
                 str(output),
                 caption=f"{source.filename}.png",
@@ -1133,6 +1232,10 @@ async def process_message(
                 progress_callback=lambda current, total: progress.report("upload", current, total),
             )
             await progress.finish("处理完成，缩略图已发送。")
+            if isinstance(sent, list):
+                sent = sent[0] if sent else None
+            with contextlib.suppress(Exception):
+                await _offer_pack_forward(client, message, sent)
             if access is not None and forward is not None:
                 await _forward_note_success(client, access, forward, message, output)
         except Exception as exc:
@@ -1216,6 +1319,10 @@ async def poll() -> None:
         )
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+
+    @mt_client.on(events.CallbackQuery(pattern=b"^pack:"))
+    async def on_pack_offer(event: events.CallbackQuery.Event) -> None:
+        await _handle_pack_callback(event)
 
     @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme):"))
     async def on_setting(event: events.CallbackQuery.Event) -> None:
