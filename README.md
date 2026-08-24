@@ -6,13 +6,26 @@ Telegram 视频缩略图机器人：按需读取分块，生成 PotPlayer 风格
 
 ## 主题示例
 
-| PotPlayer 风格 | 白底黑字 |
-| --- | --- |
-| ![PotPlayer 风格](docs/examples/theme-potplayer.jpg) | ![白底黑字](docs/examples/theme-white-bg.jpg) |
-| **纯图无信息** | **黑底白字** |
-| ![纯图无信息](docs/examples/theme-pure-image.jpg) | ![黑底白字](docs/examples/theme-minimal-white.jpg) |
+<table>
+<tr>
+<th align="center">PotPlayer 风格</th>
+<th align="center">白底黑字</th>
+</tr>
+<tr>
+<td><img src="docs/examples/theme-potplayer.jpg" alt="PotPlayer 风格"></td>
+<td><img src="docs/examples/theme-white-bg.jpg" alt="白底黑字"></td>
+</tr>
+<tr>
+<th align="center">纯图无信息</th>
+<th align="center">黑底白字</th>
+</tr>
+<tr>
+<td><img src="docs/examples/theme-pure-image.jpg" alt="纯图无信息"></td>
+<td><img src="docs/examples/theme-minimal-white.jpg" alt="黑底白字"></td>
+</tr>
+</table>
 
-`/setting` 还可切换黑底白字、极简模式：黑。每个用户独立保存。
+`/setting` 还可切换极简模式（黑 / 白）。每个用户独立保存。
 
 机器人不会预先下载完整源视频。它只读取 FFprobe / FFmpeg 实际请求的分块，并使用任务级临时缓存避免重复下载；大视频达到自适应硬上限后会主动停止。
 
