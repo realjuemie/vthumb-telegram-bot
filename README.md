@@ -1,6 +1,18 @@
 # VThumb Telegram Bot
 
-一个可 Docker 部署的 Telegram 视频缩略图机器人。它通过 MTProto 按需读取视频分块，使用 FFprobe / FFmpeg 远程定位画面，再由 Pillow 生成带媒体信息和时间戳的视频联系表。
+Telegram 视频缩略图机器人：按需读取分块，生成 PotPlayer 风格联系表，不预先下载完整视频。
+
+**试用：** [Launch @vthumbot](https://t.me/vthumbot)
+
+## 主题示例
+
+| PotPlayer 风格 | 白底黑字 |
+| --- | --- |
+| ![PotPlayer 风格](docs/examples/theme-potplayer.jpg) | ![白底黑字](docs/examples/theme-white-bg.jpg) |
+| **纯图无信息** | **极简模式：白** |
+| ![纯图无信息](docs/examples/theme-pure-image.jpg) | ![极简模式：白](docs/examples/theme-minimal-white.jpg) |
+
+`/setting` 还可切换黑底白字、极简模式：黑。每个用户独立保存。
 
 机器人不会预先下载完整源视频。它只读取 FFprobe / FFmpeg 实际请求的分块，并使用任务级临时缓存避免重复下载；大视频达到自适应硬上限后会主动停止。
 
