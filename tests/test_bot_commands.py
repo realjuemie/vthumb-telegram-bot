@@ -43,6 +43,13 @@ class BotCommandTests(unittest.TestCase):
     def test_upload_progress_reaches_one_hundred_percent(self) -> None:
         self.assertIn("100%", format_progress("upload", 1024, 1024))
 
+    def test_pack_progress_mentions_file_send_and_bytes(self) -> None:
+        text = format_progress("pack", 5 * 1024 * 1024, 10 * 1024 * 1024)
+        self.assertIn("文件形式", text)
+        self.assertIn("5.0MB", text)
+        self.assertIn("10.0MB", text)
+        self.assertIn("50%", text)
+
     def test_setting_callback_resolves_preset(self) -> None:
         preset = setting_from_callback(b"setting:20:5")
         self.assertIsNotNone(preset)

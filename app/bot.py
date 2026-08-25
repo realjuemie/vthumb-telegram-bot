@@ -834,14 +834,29 @@ def _source_file_media(message: Any):
     )
 
 
-async def _send_pack_album(client: TelegramClient, chat_id: int, sheet, source_msg: Any, reply_to: int) -> bool:
-    """Photo+video album when possible; file-sent videos fall back to a document group."""
+async def _send_pack_album(
+    client: TelegramClient,
+    chat_id: int,
+    sheet,
+    source_msg: Any,
+    progress: "ProgressReporter | None" = None,
+) -> bool:
+    """Send as one album. File videos go out as documents; no reply quote."""
     source_file = _source_file_media(source_msg)
-    attempts = [
-        ([sheet, source_msg], False),
-        ([sheet, source_file], False) if source_file is not None else None,
-        ([sheet, source_file], True) if source_file is not None else None,
-    ]
+    file_sent = getattr(source_msg, "video", None) is None and source_file is not None
+
+    def _on_upload(current: int, total: int) -> None:
+        if progress is not None:
+            progress.report("pack", current, total)
+
+    if file_sent:
+        attempts = [([sheet, source_file], True)]
+    else:
+        attempts = [
+            ([sheet, source_msg], False),
+            ([sheet, source_file], False) if source_file is not None else None,
+            ([sheet, source_file], True) if source_file is not None else None,
+        ]
     for item in attempts:
         if item is None:
             continue
@@ -851,12 +866,11 @@ async def _send_pack_album(client: TelegramClient, chat_id: int, sheet, source_m
                 chat_id,
                 files,
                 force_document=as_document,
-                reply_to=reply_to,
+                progress_callback=_on_upload,
             )
             return True
         except Exception as exc:
             logging.warning("pack-forward attempt failed (document=%s): %s", as_document, exc)
-    # Last resort: one video/file message with the sheet as cover.
     if source_file is None:
         return False
     try:
@@ -865,7 +879,7 @@ async def _send_pack_album(client: TelegramClient, chat_id: int, sheet, source_m
             source_file,
             thumb=sheet if isinstance(sheet, str) else None,
             force_document=False,
-            reply_to=reply_to,
+            progress_callback=_on_upload,
         )
         return True
     except Exception as exc:
@@ -948,34 +962,40 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         with contextlib.suppress(Exception):
             await event.edit("好的，保持分开发送。")
         return
+    await event.answer("将以文件形式发送，请稍候")
+    with contextlib.suppress(Exception):
+        await event.edit(
+            "图片无法和文件视频合成相册，将以文件形式发送（仍是一条消息）。\n"
+            "大文件可能较慢，请稍候…",
+            buttons=None,
+        )
     sheet_file = offer.get("sheet_path")
-    album: list = []
+    sheet = None
     if sheet_file and Path(sheet_file).exists():
-        album.append(str(sheet_file))
+        sheet = str(sheet_file)
     else:
         sheet = _message_to_input_media(offer["result"])
-        if sheet is not None:
-            album.append(sheet)
-    # File-sent videos often have document but no .video. Passing the
-    # original Message lets Telethon reuse the media the way Telegram stored it.
-    album.append(offer["source"])
-    if len(album) < 2:
+    if sheet is None:
         await event.answer("找不到可合并的媒体。", alert=True)
         return
-    sent_ok = await _send_pack_album(
-        event.client,
-        offer["chat_id"],
-        album[0],
-        offer["source"],
-        offer["source"].id,
-    )
+    progress = ProgressReporter(event.client, offer["chat_id"], event.message_id)
+    try:
+        await progress.show_now("pack", 0, 1)
+        sent_ok = await _send_pack_album(
+            event.client,
+            offer["chat_id"],
+            sheet,
+            offer["source"],
+            progress=progress,
+        )
+    except Exception:
+        logging.exception("pack-forward crashed")
+        sent_ok = False
     if not sent_ok:
-        await event.answer("合并发送失败，请稍后重试。", alert=True)
+        await progress.finish("合并发送失败，请稍后重试。")
         return
     _drop_pack_offer(token)
-    await event.answer("已合并")
-    with contextlib.suppress(Exception):
-        await event.edit("已合并为一条消息，可长按转发。")
+    await progress.finish("已合并为一条文件消息，可长按转发。")
 
 
 # Module-level merge state. One pending merge per user at a time.
@@ -1014,19 +1034,29 @@ def configure_logging(token: str) -> None:
     root.setLevel(logging.INFO)
 
 
+def _fmt_mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f}MB"
+
+
 def format_progress(stage: str, current: int, total: int) -> str:
     labels = {
         "metadata": "正在读取视频信息",
         "frames": "正在截取视频帧",
         "compose": "正在合成缩略图",
         "upload": "正在上传成品图片",
+        "pack": "正在以文件形式发送（图片+原视频）",
     }
     label = labels.get(stage, "正在处理")
     ratio = min(1.0, max(0.0, current / total)) if total > 0 else 0.0
     filled = round(ratio * 12)
     bar = "#" * filled + "-" * (12 - filled)
     percent = round(ratio * 100)
-    detail = f" {current}/{total}" if stage == "frames" and total > 0 else ""
+    if stage == "frames" and total > 0:
+        detail = f" {current}/{total}"
+    elif stage in {"upload", "pack"} and total > 0:
+        detail = f" {_fmt_mb(current)}/{_fmt_mb(total)}"
+    else:
+        detail = ""
     return f"{label}{detail}\n[{bar}] {percent}%"
 
 
