@@ -491,13 +491,36 @@ def _merge_classify(message: Any) -> str:
     return "document"
 
 
-def _merge_input_document(message: Any):
-    doc = (
+def _merge_raw_file(message: Any):
+    return (
         getattr(message, "video", None)
         or getattr(message, "video_note", None)
         or getattr(message, "animation", None)
         or getattr(message, "document", None)
     )
+
+
+async def _merge_as_documents(client: TelegramClient, messages: list) -> tuple[list, Path | None]:
+    """Turn a mixed photo+document batch into files Telegram can group."""
+    files: list = []
+    tmp_dir: Path | None = None
+    for message in messages:
+        raw = _merge_raw_file(message)
+        if raw is not None:
+            files.append(raw)
+            continue
+        if getattr(message, "photo", None) is None:
+            continue
+        if tmp_dir is None:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="vthumb_merge_"))
+        dest = tmp_dir / f"{getattr(message, 'id', len(files))}.jpg"
+        await client.download_media(message, file=str(dest))
+        files.append(str(dest))
+    return files, tmp_dir
+
+
+def _merge_input_document(message: Any):
+    doc = _merge_raw_file(message)
     if doc is None:
         return None
     from telethon.tl.types import InputDocument, InputMediaDocument
@@ -556,71 +579,70 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
     # Caption stripping is automatic: when we re-wrap from a Photo/
     # Document, we don't carry over the original message's text
     # caption -- Telegram renders the album without any text.
-    from telethon.tl.types import (
-        InputMediaPhoto,
-        InputMediaDocument,
-        InputPhoto,
-        InputDocument,
-    )
-    media: list = []
-    for m in photos:
-        if getattr(m, "photo", None) is not None and not needs_file_album:
-            ph = m.photo
-            input_photo = InputPhoto(ph.id, ph.access_hash, ph.file_reference)
-            media.append(InputMediaPhoto(input_photo))
-        else:
-            wrapped = _merge_input_document(m)
-            if wrapped is not None:
-                media.append(wrapped)
-            elif getattr(m, "photo", None) is not None:
-                ph = m.photo
-                media.append(InputMediaPhoto(InputPhoto(ph.id, ph.access_hash, ph.file_reference)))
-    for m in videos:
-        wrapped = _merge_input_document(m)
-        if wrapped is not None:
-            media.append(wrapped)
-
-    if not media:
-        await client.send_message(
-            chat_id,
-            "✗ 没有可合并的媒体 (全部 file_id 缺失)。请重新 /merge。",
-        )
-        return
-
     logging.info(
         f"{MERGE_LOG_PREFIX} uid={user_id} firing: "
-        f"{len(photos)} photo/animation + {len(videos)} video = {len(media)} items"
+        f"{len(photos)} photo/animation + {len(videos)} video, file_album={needs_file_album}"
     )
 
-    # Telegram caps media_group at 10 items; chunk if needed.
     BATCH = 10
     sent = 0
     failed_indices: list[int] = []
-    for batch_start in range(0, len(media), BATCH):
-        batch = media[batch_start:batch_start + BATCH]
-        try:
-            await client.send_file(
+    tmp_dir: Path | None = None
+    media: list = []
+    try:
+        if needs_file_album:
+            media, tmp_dir = await _merge_as_documents(client, photos + videos)
+        else:
+            from telethon.tl.types import InputMediaPhoto, InputPhoto
+            media = []
+            for m in photos:
+                if getattr(m, "photo", None) is not None:
+                    ph = m.photo
+                    media.append(InputMediaPhoto(InputPhoto(ph.id, ph.access_hash, ph.file_reference)))
+                else:
+                    wrapped = _merge_input_document(m)
+                    if wrapped is not None:
+                        media.append(wrapped)
+            for m in videos:
+                wrapped = _merge_input_document(m)
+                if wrapped is not None:
+                    media.append(wrapped)
+
+        if not media:
+            await client.send_message(
                 chat_id,
-                batch,
-                force_document=needs_file_album,
+                "✗ 没有可合并的媒体 (全部 file_id 缺失)。请重新 /merge。",
             )
-            sent += len(batch)
-        except Exception as e:
-            err = str(e).lower()
-            logging.warning(f"{MERGE_LOG_PREFIX} uid={user_id} batch failed: {e}")
-            if any(tok in err for tok in (
-                "file_id_invalid", "media_invalid", "file reference",
-                "invalid file", "wrong file id", "media_empty",
-                "400 bad_request",
-            )):
-                for i in range(len(batch)):
-                    failed_indices.append(batch_start + i + 1)
-            else:
-                await client.send_message(
+            return
+
+        for batch_start in range(0, len(media), BATCH):
+            batch = media[batch_start:batch_start + BATCH]
+            try:
+                await client.send_file(
                     chat_id,
-                    f"⚠️ 第 {batch_start + 1}-{batch_start + len(batch)} 条合并失败: {e}",
+                    batch,
+                    force_document=needs_file_album,
                 )
-                continue
+                sent += len(batch)
+            except Exception as e:
+                err = str(e).lower()
+                logging.warning(f"{MERGE_LOG_PREFIX} uid={user_id} batch failed: {e}")
+                if any(tok in err for tok in (
+                    "file_id_invalid", "media_invalid", "file reference",
+                    "invalid file", "wrong file id", "media_empty",
+                    "400 bad_request",
+                )):
+                    for i in range(len(batch)):
+                        failed_indices.append(batch_start + i + 1)
+                else:
+                    await client.send_message(
+                        chat_id,
+                        f"⚠️ 第 {batch_start + 1}-{batch_start + len(batch)} 条合并失败: {e}",
+                    )
+                    continue
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     summary = [f"✓ 已合并 {state['expected_count']} 条 ({len(photos)} 图 + {len(videos)} 视频)"]
     if sent:
@@ -874,18 +896,20 @@ async def _send_pack_album(
     source_file = _source_file_media(source_msg)
     file_sent = getattr(source_msg, "video", None) is None and source_file is not None
 
-    def _on_upload(current: int, total: int) -> None:
-        if progress is not None:
-            progress.report("pack", current, total)
-
     if file_sent:
         attempts = [([sheet, source_file], True)]
+        stage = "pack"
     else:
         attempts = [
             ([sheet, source_msg], False),
             ([sheet, source_file], False) if source_file is not None else None,
             ([sheet, source_file], True) if source_file is not None else None,
         ]
+        stage = "pack_media"
+
+    def _on_upload(current: int, total: int) -> None:
+        if progress is not None:
+            progress.report(stage, current, total)
     for item in attempts:
         if item is None:
             continue
@@ -991,13 +1015,28 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         with contextlib.suppress(Exception):
             await event.edit("好的，保持分开发送。")
         return
-    await event.answer("将以文件形式发送，请稍候")
-    with contextlib.suppress(Exception):
-        await event.edit(
-            "图片无法和文件视频合成相册，将以文件形式发送（仍是一条消息）。\n"
-            "大文件可能较慢，请稍候…",
-            buttons=None,
-        )
+    source = offer["source"]
+    result = offer["result"]
+    source_is_file = getattr(source, "video", None) is None
+    result_is_file = (
+        getattr(result, "photo", None) is None
+        and getattr(result, "document", None) is not None
+    )
+    use_files = source_is_file or result_is_file
+    if use_files:
+        await event.answer("将以文件形式发送，请稍候")
+        with contextlib.suppress(Exception):
+            await event.edit(
+                "图片无法和文件视频合成相册，将以文件形式发送（仍是一条消息）。\n"
+                "大文件可能较慢，请稍候…",
+                buttons=None,
+            )
+        progress_stage = "pack"
+    else:
+        await event.answer("正在合并，请稍候")
+        with contextlib.suppress(Exception):
+            await event.edit("正在把缩略图和视频合成一条消息…", buttons=None)
+        progress_stage = "pack_media"
     sheet_file = offer.get("sheet_path")
     sheet = None
     if sheet_file and Path(sheet_file).exists():
@@ -1009,7 +1048,7 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         return
     progress = ProgressReporter(event.client, offer["chat_id"], event.message_id)
     try:
-        await progress.show_now("pack", 0, 1)
+        await progress.show_now(progress_stage, 0, 1)
         sent_ok = await _send_pack_album(
             event.client,
             offer["chat_id"],
@@ -1024,7 +1063,11 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         await progress.finish("合并发送失败，请稍后重试。")
         return
     _drop_pack_offer(token)
-    await progress.finish("已合并为一条文件消息，可长按转发。")
+    await progress.finish(
+        "已合并为一条文件消息，可长按转发。"
+        if progress_stage == "pack"
+        else "已合并为一条消息，可长按转发。"
+    )
 
 
 # Module-level merge state. One pending merge per user at a time.
@@ -1074,6 +1117,7 @@ def format_progress(stage: str, current: int, total: int) -> str:
         "compose": "正在合成缩略图",
         "upload": "正在上传成品图片",
         "pack": "正在以文件形式发送（图片+原视频）",
+        "pack_media": "正在合并为一条媒体消息",
     }
     label = labels.get(stage, "正在处理")
     ratio = min(1.0, max(0.0, current / total)) if total > 0 else 0.0
@@ -1082,7 +1126,7 @@ def format_progress(stage: str, current: int, total: int) -> str:
     percent = round(ratio * 100)
     if stage == "frames" and total > 0:
         detail = f" {current}/{total}"
-    elif stage in {"upload", "pack"} and total > 0:
+    elif stage in {"upload", "pack", "pack_media"} and total > 0:
         detail = f" {_fmt_mb(current)}/{_fmt_mb(total)}"
     else:
         detail = ""

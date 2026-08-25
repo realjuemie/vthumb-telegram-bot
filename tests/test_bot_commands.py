@@ -51,6 +51,11 @@ class BotCommandTests(unittest.TestCase):
         self.assertIn("10.0MB", text)
         self.assertIn("50%", text)
 
+    def test_pack_media_progress_does_not_say_file(self) -> None:
+        text = format_progress("pack_media", 1, 2)
+        self.assertNotIn("文件形式", text)
+        self.assertIn("媒体", text)
+
     def test_setting_callback_resolves_preset(self) -> None:
         preset = setting_from_callback(b"setting:20:5")
         self.assertIsNotNone(preset)
