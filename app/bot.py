@@ -825,23 +825,43 @@ def _message_to_input_media(message: Any):
     return InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference))
 
 
+def _drop_pack_offer(token: str) -> dict | None:
+    offer = _pack_offers.pop(token, None)
+    if offer and offer.get("keep_dir"):
+        shutil.rmtree(offer["keep_dir"], ignore_errors=True)
+    return offer
+
+
 def _purge_pack_offers() -> None:
     now = time.time()
     expired = [key for key, item in _pack_offers.items() if item.get("expires", 0) < now]
     for key in expired:
-        _pack_offers.pop(key, None)
+        _drop_pack_offer(key)
 
 
-async def _offer_pack_forward(client: TelegramClient, source_msg: Any, result_msg: Any) -> None:
+async def _offer_pack_forward(
+    client: TelegramClient,
+    source_msg: Any,
+    result_msg: Any,
+    sheet_path: Path | None = None,
+) -> None:
     if result_msg is None or source_msg is None:
         return
     _purge_pack_offers()
     token = secrets.token_hex(4)
+    keep_dir: Path | None = None
+    kept: Path | None = None
+    if sheet_path and Path(sheet_path).exists():
+        keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_pack_"))
+        kept = keep_dir / Path(sheet_path).name
+        shutil.copy2(sheet_path, kept)
     _pack_offers[token] = {
         "user_id": source_msg.sender_id,
         "chat_id": source_msg.chat_id,
         "source": source_msg,
         "result": result_msg,
+        "sheet_path": kept,
+        "keep_dir": keep_dir,
         "expires": time.time() + PACK_OFFER_TTL_SEC,
     }
     await client.send_message(
@@ -866,7 +886,7 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
     action, token = parts[1], parts[2]
     offer = _pack_offers.get(token)
     if offer is None or offer.get("expires", 0) < time.time():
-        _pack_offers.pop(token, None)
+        _drop_pack_offer(token)
         await event.answer("这条询问已过期。", alert=True)
         with contextlib.suppress(Exception):
             await event.edit("这条合并询问已过期。")
@@ -875,28 +895,50 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         await event.answer("这不是你的任务。", alert=True)
         return
     if action == "n":
-        _pack_offers.pop(token, None)
+        _drop_pack_offer(token)
         await event.answer("好的")
         with contextlib.suppress(Exception):
             await event.edit("好的，保持分开发送。")
         return
-    sheet = _message_to_input_media(offer["result"])
-    video = _message_to_input_media(offer["source"])
-    if sheet is None or video is None:
+    sheet_file = offer.get("sheet_path")
+    album: list = []
+    if sheet_file and Path(sheet_file).exists():
+        album.append(str(sheet_file))
+    else:
+        sheet = _message_to_input_media(offer["result"])
+        if sheet is not None:
+            album.append(sheet)
+    # File-sent videos often have document but no .video. Passing the
+    # original Message lets Telethon reuse the media the way Telegram stored it.
+    album.append(offer["source"])
+    if len(album) < 2:
         await event.answer("找不到可合并的媒体。", alert=True)
         return
     try:
         await event.client.send_file(
             offer["chat_id"],
-            [sheet, video],
+            album,
             force_document=False,
             reply_to=offer["source"].id,
         )
     except Exception as exc:
         logging.warning("pack-forward album failed: %s", exc)
-        await event.answer("合并发送失败，请稍后重试。", alert=True)
-        return
-    _pack_offers.pop(token, None)
+        video = _message_to_input_media(offer["source"])
+        if video is None:
+            await event.answer("合并发送失败，请稍后重试。", alert=True)
+            return
+        try:
+            await event.client.send_file(
+                offer["chat_id"],
+                [album[0], video],
+                force_document=False,
+                reply_to=offer["source"].id,
+            )
+        except Exception as exc2:
+            logging.warning("pack-forward retry failed: %s", exc2)
+            await event.answer("合并发送失败，请稍后重试。", alert=True)
+            return
+    _drop_pack_offer(token)
     await event.answer("已合并")
     with contextlib.suppress(Exception):
         await event.edit("已合并为一条消息，可长按转发。")
@@ -1235,7 +1277,7 @@ async def process_message(
             if isinstance(sent, list):
                 sent = sent[0] if sent else None
             with contextlib.suppress(Exception):
-                await _offer_pack_forward(client, message, sent)
+                await _offer_pack_forward(client, message, sent, output)
             if access is not None and forward is not None:
                 await _forward_note_success(client, access, forward, message, output)
         except Exception as exc:
