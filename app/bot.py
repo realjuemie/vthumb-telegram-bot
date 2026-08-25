@@ -890,53 +890,45 @@ async def _send_pack_album(
     chat_id: int,
     sheet,
     source_msg: Any,
+    result_msg: Any | None = None,
+    as_files: bool = False,
     progress: "ProgressReporter | None" = None,
 ) -> bool:
-    """Send as one album. File videos go out as documents without reply quotes."""
+    """Reuse existing media IDs when both items are viewable; re-upload only for files."""
     source_file = _source_file_media(source_msg)
-    file_sent = getattr(source_msg, "video", None) is None and source_file is not None
-
-    if file_sent:
-        attempts = [([sheet, source_file], True)]
-        stage = "pack"
-    else:
-        attempts = [
-            ([sheet, source_msg], False),
-            ([sheet, source_file], False) if source_file is not None else None,
-            ([sheet, source_file], True) if source_file is not None else None,
-        ]
-        stage = "pack_media"
 
     def _on_upload(current: int, total: int) -> None:
         if progress is not None:
-            progress.report(stage, current, total)
-    for item in attempts:
-        if item is None:
-            continue
-        files, as_document = item
-        try:
-            await client.send_file(
-                chat_id,
-                files,
-                force_document=as_document,
-                progress_callback=_on_upload,
-            )
-            return True
-        except Exception as exc:
-            logging.warning("pack-forward attempt failed (document=%s): %s", as_document, exc)
-    if source_file is None:
+            progress.report("pack" if as_files else "pack_media", current, total)
+
+    if not as_files:
+        thumb = _message_to_input_media(result_msg) if result_msg is not None else None
+        video = _message_to_input_media(source_msg)
+        attempts = []
+        if thumb is not None and video is not None:
+            attempts.append([thumb, video])
+        if result_msg is not None:
+            attempts.append([result_msg, source_msg])
+        for album in attempts:
+            try:
+                await client.send_file(chat_id, album, force_document=False)
+                return True
+            except Exception as exc:
+                logging.warning("pack-forward reuse failed: %s", exc)
+        return False
+
+    if source_file is None or not sheet:
         return False
     try:
         await client.send_file(
             chat_id,
-            source_file,
-            thumb=sheet if isinstance(sheet, str) else None,
-            force_document=False,
+            [sheet, source_file],
+            force_document=True,
             progress_callback=_on_upload,
         )
         return True
     except Exception as exc:
-        logging.warning("pack-forward cover fallback failed: %s", exc)
+        logging.warning("pack-forward file album failed: %s", exc)
         return False
 
 
@@ -1039,13 +1031,8 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         progress_stage = "pack_media"
     sheet_file = offer.get("sheet_path")
     sheet = None
-    if sheet_file and Path(sheet_file).exists():
+    if use_files and sheet_file and Path(sheet_file).exists():
         sheet = str(sheet_file)
-    else:
-        sheet = _message_to_input_media(offer["result"])
-    if sheet is None:
-        await event.answer("找不到可合并的媒体。", alert=True)
-        return
     progress = ProgressReporter(event.client, offer["chat_id"], event.message_id)
     try:
         await progress.show_now(progress_stage, 0, 1)
@@ -1053,7 +1040,9 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
             event.client,
             offer["chat_id"],
             sheet,
-            offer["source"],
+            source,
+            result_msg=result,
+            as_files=use_files,
             progress=progress,
         )
     except Exception:
