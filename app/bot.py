@@ -400,7 +400,7 @@ async def _merge_handle(
     notify = await client.send_message(
         message.chat_id,
         f"✓ 模式开启, 等待接下来 {n} 条媒体消息。\n"
-        f"  支持: 图片 / 视频 / 动图 / 圆视频。\n"
+        f"  支持: 图片 / 视频 / 文件视频 / 动图 / 圆视频。\n"
         f"  图片会排在前, 视频排在后, 自带的说明文字会被去除。\n"
         f"  5 秒静默后开始合并。\n"
         f"  取消: /merge cancel",
@@ -467,7 +467,7 @@ async def _merge_collect_media(
 
 
 def _merge_classify(message: Any) -> str:
-    """Return 'photo', 'animation', 'video', 'video_note', or ''."""
+    """Return photo/animation/video/video_note/file_video/document, or ''."""
     if getattr(message, "video", None):
         return "video"
     if getattr(message, "video_note", None):
@@ -476,7 +476,32 @@ def _merge_classify(message: Any) -> str:
         return "animation"
     if getattr(message, "photo", None):
         return "photo"
-    return ""
+    if extract_video(message):
+        return "file_video"
+    document = getattr(message, "document", None)
+    if document is None:
+        return ""
+    mime = ""
+    file_info = getattr(message, "file", None)
+    if file_info is not None:
+        mime = (getattr(file_info, "mime_type", None) or "")
+    mime = (mime or getattr(document, "mime_type", None) or "").lower()
+    if mime.startswith("image/"):
+        return "photo"
+    return "document"
+
+
+def _merge_input_document(message: Any):
+    doc = (
+        getattr(message, "video", None)
+        or getattr(message, "video_note", None)
+        or getattr(message, "animation", None)
+        or getattr(message, "document", None)
+    )
+    if doc is None:
+        return None
+    from telethon.tl.types import InputDocument, InputMediaDocument
+    return InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference))
 
 
 def _merge_schedule_debounce(state: dict, on_fire) -> None:
@@ -505,8 +530,14 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
 
     chat_id = state["chat_id"]
     msgs = state["collected"]
-    photos = [m for m in msgs if _merge_classify(m) in ("photo", "animation")]
-    videos = [m for m in msgs if _merge_classify(m) in ("video", "video_note")]
+    photos = [m for m in msgs if _merge_classify(m) in {"photo", "animation"}]
+    videos = [
+        m for m in msgs
+        if _merge_classify(m) in {"video", "video_note", "file_video", "document"}
+    ]
+    needs_file_album = any(
+        _merge_classify(m) in {"file_video", "document"} for m in msgs
+    )
 
     # Build Telethon InputMedia objects, photos first, videos last,
     # using only file_id references -- no downloads, no disk I/O.
@@ -533,23 +564,21 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
     )
     media: list = []
     for m in photos:
-        if _merge_classify(m) == "photo":
+        if getattr(m, "photo", None) is not None and not needs_file_album:
             ph = m.photo
             input_photo = InputPhoto(ph.id, ph.access_hash, ph.file_reference)
             media.append(InputMediaPhoto(input_photo))
-        else:  # animation
-            doc = m.animation
-            input_doc = InputDocument(doc.id, doc.access_hash, doc.file_reference)
-            media.append(InputMediaDocument(input_doc))
+        else:
+            wrapped = _merge_input_document(m)
+            if wrapped is not None:
+                media.append(wrapped)
+            elif getattr(m, "photo", None) is not None:
+                ph = m.photo
+                media.append(InputMediaPhoto(InputPhoto(ph.id, ph.access_hash, ph.file_reference)))
     for m in videos:
-        if _merge_classify(m) == "video":
-            doc = m.video
-            input_doc = InputDocument(doc.id, doc.access_hash, doc.file_reference)
-            media.append(InputMediaDocument(input_doc))
-        else:  # video_note
-            doc = m.video_note
-            input_doc = InputDocument(doc.id, doc.access_hash, doc.file_reference)
-            media.append(InputMediaDocument(input_doc))
+        wrapped = _merge_input_document(m)
+        if wrapped is not None:
+            media.append(wrapped)
 
     if not media:
         await client.send_message(
@@ -573,7 +602,7 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
             await client.send_file(
                 chat_id,
                 batch,
-                force_document=False,
+                force_document=needs_file_album,
             )
             sent += len(batch)
         except Exception as e:
@@ -841,10 +870,9 @@ async def _send_pack_album(
     source_msg: Any,
     progress: "ProgressReporter | None" = None,
 ) -> bool:
-    """Send as one album. File videos go out as documents; quote the source once."""
+    """Send as one album. File videos go out as documents without reply quotes."""
     source_file = _source_file_media(source_msg)
     file_sent = getattr(source_msg, "video", None) is None and source_file is not None
-    reply_to = getattr(source_msg, "id", None)
 
     def _on_upload(current: int, total: int) -> None:
         if progress is not None:
@@ -867,7 +895,6 @@ async def _send_pack_album(
                 chat_id,
                 files,
                 force_document=as_document,
-                reply_to=reply_to,
                 progress_callback=_on_upload,
             )
             return True
@@ -881,7 +908,6 @@ async def _send_pack_album(
             source_file,
             thumb=sheet if isinstance(sheet, str) else None,
             force_document=False,
-            reply_to=reply_to,
             progress_callback=_on_upload,
         )
         return True

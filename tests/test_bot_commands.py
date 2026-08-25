@@ -13,6 +13,7 @@ from app.bot import (
     format_user_label,
     setting_from_callback,
     short_filename,
+    _merge_classify,
 )
 
 
@@ -128,6 +129,23 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tg://user?id=99", text)
         self.assertIn(">99</a>", text)
         self.assertIn("完成 2 个任务", text)
+
+    def test_merge_classifies_file_sent_video(self) -> None:
+        file_info = type("F", (), {"name": "clip.mp4", "mime_type": "video/mp4", "size": 10})()
+        document = type("D", (), {"mime_type": "video/mp4", "size": 10})()
+        message = type(
+            "M",
+            (),
+            {
+                "video": None,
+                "video_note": None,
+                "animation": None,
+                "photo": None,
+                "document": document,
+                "file": file_info,
+            },
+        )()
+        self.assertEqual(_merge_classify(message), "file_video")
 
 
 if __name__ == "__main__":
