@@ -825,6 +825,54 @@ def _message_to_input_media(message: Any):
     return InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference))
 
 
+def _source_file_media(message: Any):
+    return (
+        getattr(message, "video", None)
+        or getattr(message, "document", None)
+        or getattr(message, "video_note", None)
+        or getattr(message, "animation", None)
+    )
+
+
+async def _send_pack_album(client: TelegramClient, chat_id: int, sheet, source_msg: Any, reply_to: int) -> bool:
+    """Photo+video album when possible; file-sent videos fall back to a document group."""
+    source_file = _source_file_media(source_msg)
+    attempts = [
+        ([sheet, source_msg], False),
+        ([sheet, source_file], False) if source_file is not None else None,
+        ([sheet, source_file], True) if source_file is not None else None,
+    ]
+    for item in attempts:
+        if item is None:
+            continue
+        files, as_document = item
+        try:
+            await client.send_file(
+                chat_id,
+                files,
+                force_document=as_document,
+                reply_to=reply_to,
+            )
+            return True
+        except Exception as exc:
+            logging.warning("pack-forward attempt failed (document=%s): %s", as_document, exc)
+    # Last resort: one video/file message with the sheet as cover.
+    if source_file is None:
+        return False
+    try:
+        await client.send_file(
+            chat_id,
+            source_file,
+            thumb=sheet if isinstance(sheet, str) else None,
+            force_document=False,
+            reply_to=reply_to,
+        )
+        return True
+    except Exception as exc:
+        logging.warning("pack-forward cover fallback failed: %s", exc)
+        return False
+
+
 def _drop_pack_offer(token: str) -> dict | None:
     offer = _pack_offers.pop(token, None)
     if offer and offer.get("keep_dir"):
@@ -914,30 +962,16 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
     if len(album) < 2:
         await event.answer("找不到可合并的媒体。", alert=True)
         return
-    try:
-        await event.client.send_file(
-            offer["chat_id"],
-            album,
-            force_document=False,
-            reply_to=offer["source"].id,
-        )
-    except Exception as exc:
-        logging.warning("pack-forward album failed: %s", exc)
-        video = _message_to_input_media(offer["source"])
-        if video is None:
-            await event.answer("合并发送失败，请稍后重试。", alert=True)
-            return
-        try:
-            await event.client.send_file(
-                offer["chat_id"],
-                [album[0], video],
-                force_document=False,
-                reply_to=offer["source"].id,
-            )
-        except Exception as exc2:
-            logging.warning("pack-forward retry failed: %s", exc2)
-            await event.answer("合并发送失败，请稍后重试。", alert=True)
-            return
+    sent_ok = await _send_pack_album(
+        event.client,
+        offer["chat_id"],
+        album[0],
+        offer["source"],
+        offer["source"].id,
+    )
+    if not sent_ok:
+        await event.answer("合并发送失败，请稍后重试。", alert=True)
+        return
     _drop_pack_offer(token)
     await event.answer("已合并")
     with contextlib.suppress(Exception):
