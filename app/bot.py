@@ -841,9 +841,10 @@ async def _send_pack_album(
     source_msg: Any,
     progress: "ProgressReporter | None" = None,
 ) -> bool:
-    """Send as one album. File videos go out as documents; no reply quote."""
+    """Send as one album. File videos go out as documents; quote the source once."""
     source_file = _source_file_media(source_msg)
     file_sent = getattr(source_msg, "video", None) is None and source_file is not None
+    reply_to = getattr(source_msg, "id", None)
 
     def _on_upload(current: int, total: int) -> None:
         if progress is not None:
@@ -866,6 +867,7 @@ async def _send_pack_album(
                 chat_id,
                 files,
                 force_document=as_document,
+                reply_to=reply_to,
                 progress_callback=_on_upload,
             )
             return True
@@ -879,6 +881,7 @@ async def _send_pack_album(
             source_file,
             thumb=sheet if isinstance(sheet, str) else None,
             force_document=False,
+            reply_to=reply_to,
             progress_callback=_on_upload,
         )
         return True
