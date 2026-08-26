@@ -1,12 +1,16 @@
+import hashlib
 import json
+import logging
 import math
 import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
+
+logger = logging.getLogger(__name__)
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -110,6 +114,191 @@ def run_process(args: list[str], timeout: int) -> subprocess.CompletedProcess[st
     )
 
 
+def _positive_float(value: object) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if number <= 0 or number != number or number == float("inf"):
+        return 0.0
+    return number
+
+
+def _fps_from_rate(rate: object) -> float:
+    text = str(rate or "").strip()
+    if not text or text in {"0/0", "N/A"}:
+        return 0.0
+    if "/" in text:
+        num_text, den_text = text.split("/", 1)
+        num, den = _positive_float(num_text), _positive_float(den_text)
+        return num / den if num and den else 0.0
+    return _positive_float(text)
+
+
+def _probe_duration(fmt: dict, video: dict) -> float:
+    """Prefer the shorter of container vs stream duration.
+
+    Some files advertise a container duration longer than the actual
+    elementary stream (padding, bad mvhd). Sampling against the longer
+    value seeks past EOF: ffmpeg then exits 0 with no file, or keeps
+    emitting the last keyframe. Either way the sheet stops looking new
+    around ~9 tiles on a 16-frame preset.
+    """
+    candidates = [
+        _positive_float(fmt.get("duration")),
+        _positive_float(video.get("duration")),
+        _positive_float(video.get("tags", {}).get("DURATION") if isinstance(video.get("tags"), dict) else None),
+    ]
+    fps = _fps_from_rate(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+    frames = _positive_float(video.get("nb_frames"))
+    if fps and frames:
+        candidates.append(frames / fps)
+    positives = [item for item in candidates if item > 0]
+    return min(positives) if positives else 0.0
+
+
+MIN_FRAME_BYTES = 100
+ACCURATE_SEEK_WINDOW = 8.0
+
+
+def ffmpeg_frame_args(url: str, output: Path, *, input_ss: float, output_ss: float | None = None, copyts: bool = False) -> list[str]:
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{max(0.0, input_ss):.3f}",
+    ]
+    if copyts:
+        args.append("-copyts")
+    args.extend(["-i", url])
+    if output_ss is not None:
+        args.extend(["-ss", f"{max(0.0, output_ss):.3f}"])
+    args.extend(
+        [
+            "-an",
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1280:-2",
+            "-q:v",
+            "2",
+            # Relax ffmpeg's strict-spec check so non-standard inputs that
+            # flag "Non full-range YUV is non-standard" (commonly seen on
+            # mjpeg/mjpeg-b frames inside MKV/MOV) still encode instead of
+            # throwing -22 (Invalid argument).
+            "-strict",
+            "-1",
+            "-y",
+            str(output),
+        ]
+    )
+    return args
+
+
+def _frame_ok(path: Path) -> bool:
+    return path.exists() and path.stat().st_size >= MIN_FRAME_BYTES
+
+
+def extract_one_frame(
+    url: str,
+    timestamp: float,
+    output: Path,
+    timeout: int,
+    prefer_accurate: bool = False,
+) -> bool:
+    """Grab one jpeg, retrying when keyframe-only seek or EOF miss."""
+    timestamp = max(0.0, timestamp)
+    window = min(timestamp, ACCURATE_SEEK_WINDOW)
+    simple = (timestamp, None, False)
+    accurate = (timestamp - window, window, False) if window > 0.05 else None
+    attempts: list[tuple[float, float | None, bool]] = []
+    if prefer_accurate and accurate is not None:
+        attempts.append(accurate)
+        attempts.append(simple)
+    else:
+        attempts.append(simple)
+        if accurate is not None:
+            attempts.append(accurate)
+    for rewind in (2.0, 8.0, 20.0):
+        earlier = max(0.0, timestamp - rewind)
+        if earlier < timestamp - 0.05:
+            attempts.append((earlier, None, False))
+
+    seen: set[tuple[float, float | None, bool]] = set()
+    for input_ss, output_ss, copyts in attempts:
+        key = (round(input_ss, 3), None if output_ss is None else round(output_ss, 3), copyts)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.unlink(missing_ok=True)
+        try:
+            run_process(
+                ffmpeg_frame_args(
+                    url, output, input_ss=input_ss, output_ss=output_ss, copyts=copyts
+                ),
+                timeout,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "frame at %.3fs failed (in=%.3f out=%s copyts=%s): %s",
+                timestamp,
+                input_ss,
+                output_ss,
+                copyts,
+                type(exc).__name__,
+            )
+            continue
+        if _frame_ok(output):
+            return True
+    output.unlink(missing_ok=True)
+    return False
+
+
+def _digest(path: Path) -> str:
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def trim_trailing_duplicates(frames: list[Path], times: list[float]) -> tuple[list[Path], list[float]]:
+    """Drop a run of identical jpegs at the tail (EOF / last keyframe repeats)."""
+    if len(frames) < 2 or len(frames) != len(times):
+        return frames, times
+    hashes = [_digest(path) for path in frames]
+    end = len(frames)
+    while end > 1 and hashes[end - 1] == hashes[end - 2]:
+        end -= 1
+    if end == len(frames):
+        return frames, times
+    logger.info("dropped %d trailing duplicate frames", len(frames) - end)
+    return frames[:end], times[:end]
+
+
+def extract_frame_sequence(
+    url: str,
+    duration: float,
+    count: int,
+    tmp_dir: Path,
+    timeout: int,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    name_prefix: str = "frame",
+    prefer_accurate: bool = False,
+) -> tuple[list[Path], list[float]]:
+    frames: list[Path] = []
+    times: list[float] = []
+    for index in range(1, count + 1):
+        timestamp = sample_time(duration, index, count)
+        path = tmp_dir / f"{name_prefix}_{index:03}.jpg"
+        if extract_one_frame(url, timestamp, path, timeout, prefer_accurate=prefer_accurate):
+            frames.append(path)
+            times.append(timestamp)
+        else:
+            logger.warning("no frame at %.3fs (%s/%s)", timestamp, index, count)
+        if progress_callback:
+            progress_callback("frames", index, count)
+    return trim_trailing_duplicates(frames, times)
+
+
 def get_media_info(url: str, timeout: int) -> MediaInfo:
     result = run_process(
         [
@@ -137,7 +326,7 @@ def get_media_info(url: str, timeout: int) -> MediaInfo:
     if rotation in (90, 270):
         display_width, display_height = display_height, display_width
 
-    duration = float(info.get("format", {}).get("duration") or video.get("duration") or 0)
+    duration = _probe_duration(info.get("format") or {}, video)
     if duration <= 0:
         raise RuntimeError("Cannot determine video duration.")
 
@@ -281,51 +470,58 @@ def create_contact_sheet(
         progress_callback("metadata", 1, 1)
     tmp_dir = Path(tempfile.mkdtemp(prefix="vthumb_"))
     try:
-        frames: list[Path] = []
-        times: list[float] = []
-        for index in range(1, count + 1):
-            t = sample_time(meta.duration, index, count)
-            frame = tmp_dir / f"frame_{index:03}.jpg"
-            run_process(
-                [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-ss",
-                    f"{t:.3f}",
-                    "-i",
-                    source.url,
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=1280:-2",
-                    "-q:v",
-                    "2",
-                    # Relax ffmpeg's strict-spec check so non-standard inputs that
-                    # flag "Non full-range YUV is non-standard" (commonly seen on
-                    # mjpeg/mjpeg-b frames inside MKV/MOV) still encode instead of
-                    # throwing -22 (Invalid argument).
-                    # ffmpeg 7.x emits a hint saying `set strict_std_compliance to
-                    # at most unofficial`, but that exact option name is only
-                    # accepted by newer ffmpeg builds. The legacy `-strict <int>`
-                    # flag is the portable form: -1 = unofficial (relaxed),
-                    # -2 = experimental (most lax), 0 = strict (default).
-                    "-strict",
-                    "-1",
-                    "-y",
-                    str(frame),
-                ],
-                timeout,
+        frames, times = extract_frame_sequence(
+            source.url,
+            meta.duration,
+            count,
+            tmp_dir,
+            timeout,
+            progress_callback,
+        )
+        unique = len({_digest(path) for path in frames}) if frames else 0
+        if frames and unique < count and unique <= int(count * 0.85):
+            logger.warning(
+                "only %s unique / %s kept / %s requested; accurate-seek retry",
+                unique,
+                len(frames),
+                count,
             )
-            if frame.exists():
-                frames.append(frame)
-                times.append(t)
-            if progress_callback:
-                progress_callback("frames", index, count)
+            frames, times = extract_frame_sequence(
+                source.url,
+                meta.duration,
+                count,
+                tmp_dir,
+                timeout,
+                progress_callback,
+                name_prefix="acc",
+                prefer_accurate=True,
+            )
+        if 0 < len(frames) < count and times:
+            calibrated = max(times[-1], meta.duration * len(frames) / (count + 1))
+            if calibrated < meta.duration * 0.98:
+                logger.warning(
+                    "only %s/%s frames; retrying with duration %.3fs (was %.3fs)",
+                    len(frames),
+                    count,
+                    calibrated,
+                    meta.duration,
+                )
+                meta = replace(meta, duration=calibrated)
+                frames, times = extract_frame_sequence(
+                    source.url,
+                    meta.duration,
+                    count,
+                    tmp_dir,
+                    timeout,
+                    progress_callback,
+                    name_prefix="retry",
+                    prefer_accurate=True,
+                )
 
         if not frames:
             raise RuntimeError("FFmpeg did not produce any frames.")
+        if len(frames) < count:
+            logger.warning("composing with %s/%s frames", len(frames), count)
 
         if progress_callback:
             progress_callback("compose", 0, 1)
