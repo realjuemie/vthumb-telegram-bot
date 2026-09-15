@@ -241,8 +241,8 @@ async def handle_command(
                 f"且不超过 {settings.max_source_fetch_mb}MB。\n"
                 "5. 已读取分块会临时缓存，任务结束后自动删除。\n"
                 "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
-                "7. 以文件发送的视频，缩略图完成后可选择无损封装成可播放视频并合并（需 H.264+AAC，"
-                f"且不超过 {settings.remux_max_mb}MB；不能封装则按文件合并）。"
+                "7. 以文件发送的视频，缩略图完成后可合并成一条文件消息。"
+                f"管理员可将不超过 {settings.remux_max_mb}MB 的 H.264+AAC 文件无损封装成可播放视频。"
             )
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
@@ -883,14 +883,19 @@ def _is_file_sent_video(message: Any) -> bool:
     return extract_video(message) is not None and getattr(message, "video", None) is None
 
 
-def pack_offer_prompt(is_file_video: bool, remux_max_mb: int) -> str:
-    if is_file_video:
+def pack_offer_prompt(is_file_video: bool, remux_max_mb: int, *, allow_remux: bool = False) -> str:
+    if is_file_video and allow_remux:
         return (
             "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
             "要不要无损封装成可播放视频，再和缩略图合并成一条？\n"
             "只复制封装、不重新压缩，需要视频是 H.264、音频是 AAC（或无音轨），"
             f"且不超过 {remux_max_mb}MB。\n"
             "如果不能无损封装，会改成按文件合并成一条。"
+        )
+    if is_file_video:
+        return (
+            "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
+            "要不要把缩略图和原文件合并成一条？合并后仍是文件形式。"
         )
     return "要不要把缩略图和原视频合并成一条消息，方便转发？"
 
@@ -1017,6 +1022,7 @@ async def _offer_pack_forward(
     sheet_path: Path | None = None,
     queue: "JobQueue | None" = None,
     remux_max_mb: int = 1024,
+    allow_remux: bool = False,
 ) -> None:
     if result_msg is None or source_msg is None:
         return
@@ -1029,6 +1035,7 @@ async def _offer_pack_forward(
         kept = keep_dir / Path(sheet_path).name
         shutil.copy2(sheet_path, kept)
     is_file_video = _is_file_sent_video(source_msg)
+    can_remux = bool(allow_remux and is_file_video)
     _pack_offers[token] = {
         "user_id": source_msg.sender_id,
         "chat_id": source_msg.chat_id,
@@ -1038,11 +1045,12 @@ async def _offer_pack_forward(
         "keep_dir": keep_dir,
         "queue": queue,
         "is_file_video": is_file_video,
+        "allow_remux": can_remux,
         "remux_max_mb": remux_max_mb,
         "file_size": _source_file_size(source_msg),
         "expires": time.time() + PACK_OFFER_TTL_SEC,
     }
-    if is_file_video:
+    if can_remux:
         buttons = [
             [
                 Button.inline("转成可播放并合并", f"pack:r:{token}".encode()),
@@ -1058,7 +1066,7 @@ async def _offer_pack_forward(
         ]
     await client.send_message(
         source_msg.chat_id,
-        pack_offer_prompt(is_file_video, remux_max_mb),
+        pack_offer_prompt(is_file_video, remux_max_mb, allow_remux=can_remux),
         buttons=buttons,
         reply_to=getattr(result_msg, "id", None),
     )
@@ -1208,6 +1216,14 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
             await event.edit("好的，保持分开发送。")
         return
     if action == "r":
+        if not offer.get("allow_remux"):
+            await _fallback_merge_as_files(
+                event,
+                offer,
+                reason="封装仅管理员可用",
+            )
+            _drop_pack_offer(token)
+            return
         await _remux_pack_and_send(event, offer, token)
         return
     source = offer["source"]
@@ -1615,6 +1631,7 @@ async def process_message(
                     output,
                     queue=queue,
                     remux_max_mb=settings.remux_max_mb,
+                    allow_remux=bool(access and access.is_admin(message.sender_id)),
                 )
             if access is not None and forward is not None:
                 await _forward_note_success(client, access, forward, message, output)
