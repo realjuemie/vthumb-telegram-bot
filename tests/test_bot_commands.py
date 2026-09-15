@@ -14,6 +14,7 @@ from app.bot import (
     setting_from_callback,
     short_filename,
     _merge_classify,
+    pack_offer_prompt,
 )
 
 
@@ -151,6 +152,15 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
             },
         )()
         self.assertEqual(_merge_classify(message), "file_video")
+
+    def test_file_video_pack_prompt_mentions_remux_not_plain_merge(self) -> None:
+        text = pack_offer_prompt(True, 80)
+        self.assertIn("无损封装", text)
+        self.assertIn("80MB", text)
+        self.assertNotIn("方便转发", text)
+
+    def test_inline_video_pack_prompt_unchanged(self) -> None:
+        self.assertIn("合并成一条消息", pack_offer_prompt(False, 80))
 
 
 if __name__ == "__main__":

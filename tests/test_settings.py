@@ -18,8 +18,10 @@ def make_settings() -> Settings:
         min_source_fetch_mb=32,
         small_file_full_read_mb=64,
         source_fetch_growth_mb=16,
+        remux_max_mb=80,
         mt_proxy_url=None,
         admin_ids=frozenset(),
+        open_access=False,
         access_file="access.json",
         preferences_file="preferences.json",
     )

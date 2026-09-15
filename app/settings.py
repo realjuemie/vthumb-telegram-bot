@@ -44,6 +44,7 @@ class Settings:
     min_source_fetch_mb: int
     small_file_full_read_mb: int
     source_fetch_growth_mb: int
+    remux_max_mb: int
     mt_proxy_url: str | None
     admin_ids: frozenset[int]
     open_access: bool
@@ -107,6 +108,7 @@ class Settings:
             min_source_fetch_mb=_int_env("MIN_SOURCE_FETCH_MB", 32),
             small_file_full_read_mb=_int_env("SMALL_FILE_FULL_READ_MB", 64),
             source_fetch_growth_mb=_int_env("SOURCE_FETCH_GROWTH_MB", 16),
+            remux_max_mb=_int_env("REMUX_MAX_MB", 80),
             mt_proxy_url=os.getenv("MT_PROXY_URL") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY"),
             admin_ids=_int_set_env("ADMIN_IDS"),
             open_access=_bool_env("OPEN_ACCESS", False),

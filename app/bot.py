@@ -16,6 +16,7 @@ from telethon.sessions import MemorySession
 
 from .access_control import AccessControl
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
+from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
 from .settings import Settings
 from .user_preferences import (
     DELIVERY_FILE,
@@ -239,7 +240,9 @@ async def handle_command(
                 f"按需提升至 {settings.hard_source_fetch_ratio:.0%}，"
                 f"且不超过 {settings.max_source_fetch_mb}MB。\n"
                 "5. 已读取分块会临时缓存，任务结束后自动删除。\n"
-                "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。"
+                "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
+                "7. 以文件发送的视频，缩略图完成后可选择无损封装成可播放视频并合并（需 H.264+AAC，"
+                f"且不超过 {settings.remux_max_mb}MB）。"
             )
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
@@ -876,6 +879,27 @@ def _message_to_input_media(message: Any):
     return InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference))
 
 
+def _is_file_sent_video(message: Any) -> bool:
+    return extract_video(message) is not None and getattr(message, "video", None) is None
+
+
+def pack_offer_prompt(is_file_video: bool, remux_max_mb: int) -> str:
+    if is_file_video:
+        return (
+            "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
+            "要不要无损封装成可播放视频，再和缩略图合并成一条？\n"
+            "只复制封装、不重新压缩，需要视频是 H.264、音频是 AAC（或无音轨），"
+            f"且不超过 {remux_max_mb}MB。"
+        )
+    return "要不要把缩略图和原视频合并成一条消息，方便转发？"
+
+
+def _source_file_size(message: Any) -> int:
+    video = extract_video(message) or {}
+    size = video.get("file_size")
+    return int(size) if isinstance(size, int) and size > 0 else 0
+
+
 def _source_file_media(message: Any):
     return (
         getattr(message, "video", None)
@@ -951,6 +975,8 @@ async def _offer_pack_forward(
     source_msg: Any,
     result_msg: Any,
     sheet_path: Path | None = None,
+    queue: "JobQueue | None" = None,
+    remux_max_mb: int = 80,
 ) -> None:
     if result_msg is None or source_msg is None:
         return
@@ -962,6 +988,7 @@ async def _offer_pack_forward(
         keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_pack_"))
         kept = keep_dir / Path(sheet_path).name
         shutil.copy2(sheet_path, kept)
+    is_file_video = _is_file_sent_video(source_msg)
     _pack_offers[token] = {
         "user_id": source_msg.sender_id,
         "chat_id": source_msg.chat_id,
@@ -969,25 +996,128 @@ async def _offer_pack_forward(
         "result": result_msg,
         "sheet_path": kept,
         "keep_dir": keep_dir,
+        "queue": queue,
+        "is_file_video": is_file_video,
+        "remux_max_mb": remux_max_mb,
+        "file_size": _source_file_size(source_msg),
         "expires": time.time() + PACK_OFFER_TTL_SEC,
     }
-    await client.send_message(
-        source_msg.chat_id,
-        "要不要把缩略图和原视频合并成一条消息，方便转发？",
-        buttons=[
+    if is_file_video:
+        buttons = [
+            [
+                Button.inline("转成可播放并合并", f"pack:r:{token}".encode()),
+                Button.inline("不用了", f"pack:n:{token}".encode()),
+            ]
+        ]
+    else:
+        buttons = [
             [
                 Button.inline("合并为一条", f"pack:y:{token}".encode()),
                 Button.inline("不用了", f"pack:n:{token}".encode()),
             ]
-        ],
+        ]
+    await client.send_message(
+        source_msg.chat_id,
+        pack_offer_prompt(is_file_video, remux_max_mb),
+        buttons=buttons,
         reply_to=getattr(result_msg, "id", None),
     )
+
+
+async def _remux_pack_and_send(event: events.CallbackQuery.Event, offer: dict, token: str) -> None:
+    remux_max_mb = int(offer.get("remux_max_mb") or 80)
+    file_size = int(offer.get("file_size") or 0)
+    limit = remux_max_mb * 1024 * 1024
+    if file_size <= 0 or file_size > limit:
+        await event.answer("超出无损封装大小上限", alert=True)
+        with contextlib.suppress(Exception):
+            await event.edit(
+                f"这个文件超过 {remux_max_mb}MB，只做无损封装、不重新压缩。",
+                buttons=None,
+            )
+        _drop_pack_offer(token)
+        return
+    await event.answer("开始无损封装，请稍候")
+    with contextlib.suppress(Exception):
+        await event.edit("正在无损封装成可播放视频，请稍候…", buttons=None)
+    keep_dir = offer.get("keep_dir")
+    if keep_dir is None:
+        keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_remux_"))
+        offer["keep_dir"] = keep_dir
+    keep_dir = Path(keep_dir)
+    src_path = keep_dir / "source.bin"
+    dst_path = keep_dir / "playable.mp4"
+    sheet_file = offer.get("sheet_path")
+    queue = offer.get("queue")
+    progress = ProgressReporter(event.client, offer["chat_id"], event.message_id)
+    joined = False
+    try:
+        if queue is not None:
+            await queue.join(event.client, offer["chat_id"], event.message_id, "remux.mp4")
+            joined = True
+        await progress.show_now("remux_dl", 0, file_size)
+
+        def _on_dl(current: int, total: int) -> None:
+            progress.report("remux_dl", current, total or file_size)
+
+        await event.client.download_media(
+            offer["source"],
+            file=str(src_path),
+            progress_callback=_on_dl,
+        )
+        await progress.show_now("remux", 0, 1)
+        streams = await asyncio.to_thread(probe_streams, src_path)
+        ok, reason = evaluate_copy_remux(streams)
+        if not ok:
+            await progress.finish(reason)
+            return
+        await asyncio.to_thread(remux_copy_mp4, src_path, dst_path)
+        await progress.show_now("pack_media", 0, max(1, dst_path.stat().st_size))
+        album: list[str] = []
+        if sheet_file and Path(sheet_file).exists():
+            album.append(str(sheet_file))
+        album.append(str(dst_path))
+        sent_ok = False
+        try:
+            await event.client.send_file(
+                offer["chat_id"],
+                album,
+                force_document=False,
+                supports_streaming=True,
+                progress_callback=lambda current, total: progress.report("pack_media", current, total),
+            )
+            sent_ok = True
+        except Exception as exc:
+            logging.warning("remux album failed: %s", exc)
+            try:
+                kwargs: dict[str, Any] = {
+                    "force_document": False,
+                    "supports_streaming": True,
+                    "progress_callback": lambda current, total: progress.report("pack_media", current, total),
+                }
+                if sheet_file and Path(sheet_file).exists():
+                    kwargs["thumb"] = str(sheet_file)
+                await event.client.send_file(offer["chat_id"], str(dst_path), **kwargs)
+                sent_ok = True
+            except Exception:
+                logging.exception("remux video send failed")
+        if not sent_ok:
+            await progress.finish("封装成功但发送失败，请稍后重试。")
+            return
+        await progress.finish("已封装为可播放视频并合并发送。")
+    except Exception:
+        logging.exception("remux-pack crashed")
+        await progress.finish("无损封装失败，这个文件不能直接复制进可播放格式。")
+    finally:
+        if joined and queue is not None:
+            await queue.leave()
+        _drop_pack_offer(token)
 
 
 async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
     raw = (event.data or b"").decode("utf-8", "replace")
     parts = raw.split(":")
-    if len(parts) != 3 or parts[0] != "pack" or parts[1] not in {"y", "n"}:
+    if len(parts) != 3 or parts[0] != "pack" or parts[1] not in {"y", "n", "r"}:
         await event.answer("按钮已失效。", alert=True)
         return
     action, token = parts[1], parts[2]
@@ -1006,6 +1136,9 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         await event.answer("好的")
         with contextlib.suppress(Exception):
             await event.edit("好的，保持分开发送。")
+        return
+    if action == "r":
+        await _remux_pack_and_send(event, offer, token)
         return
     source = offer["source"]
     result = offer["result"]
@@ -1107,6 +1240,8 @@ def format_progress(stage: str, current: int, total: int) -> str:
         "upload": "正在上传成品图片",
         "pack": "正在以文件形式发送（图片+原视频）",
         "pack_media": "正在合并为一条媒体消息",
+        "remux_dl": "正在下载原文件以便封装",
+        "remux": "正在无损封装为可播放视频",
     }
     label = labels.get(stage, "正在处理")
     ratio = min(1.0, max(0.0, current / total)) if total > 0 else 0.0
@@ -1115,7 +1250,7 @@ def format_progress(stage: str, current: int, total: int) -> str:
     percent = round(ratio * 100)
     if stage == "frames" and total > 0:
         detail = f" {current}/{total}"
-    elif stage in {"upload", "pack", "pack_media"} and total > 0:
+    elif stage in {"upload", "pack", "pack_media", "remux_dl"} and total > 0:
         detail = f" {_fmt_mb(current)}/{_fmt_mb(total)}"
     else:
         detail = ""
@@ -1403,7 +1538,14 @@ async def process_message(
             if isinstance(sent, list):
                 sent = sent[0] if sent else None
             with contextlib.suppress(Exception):
-                await _offer_pack_forward(client, message, sent, output)
+                await _offer_pack_forward(
+                    client,
+                    message,
+                    sent,
+                    output,
+                    queue=queue,
+                    remux_max_mb=settings.remux_max_mb,
+                )
             if access is not None and forward is not None:
                 await _forward_note_success(client, access, forward, message, output)
         except Exception as exc:
