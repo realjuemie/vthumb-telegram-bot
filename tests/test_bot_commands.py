@@ -157,6 +157,7 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         text = pack_offer_prompt(True, 80)
         self.assertIn("无损封装", text)
         self.assertIn("80MB", text)
+        self.assertIn("按文件合并", text)
         self.assertNotIn("方便转发", text)
 
     def test_inline_video_pack_prompt_unchanged(self) -> None:

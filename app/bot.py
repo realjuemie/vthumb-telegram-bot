@@ -242,7 +242,7 @@ async def handle_command(
                 "5. 已读取分块会临时缓存，任务结束后自动删除。\n"
                 "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
                 "7. 以文件发送的视频，缩略图完成后可选择无损封装成可播放视频并合并（需 H.264+AAC，"
-                f"且不超过 {settings.remux_max_mb}MB）。"
+                f"且不超过 {settings.remux_max_mb}MB；不能封装则按文件合并）。"
             )
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
@@ -889,7 +889,8 @@ def pack_offer_prompt(is_file_video: bool, remux_max_mb: int) -> str:
             "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
             "要不要无损封装成可播放视频，再和缩略图合并成一条？\n"
             "只复制封装、不重新压缩，需要视频是 H.264、音频是 AAC（或无音轨），"
-            f"且不超过 {remux_max_mb}MB。"
+            f"且不超过 {remux_max_mb}MB。\n"
+            "如果不能无损封装，会改成按文件合并成一条。"
         )
     return "要不要把缩略图和原视频合并成一条消息，方便转发？"
 
@@ -956,6 +957,45 @@ async def _send_pack_album(
         return False
 
 
+async def _fallback_merge_as_files(
+    event: events.CallbackQuery.Event,
+    offer: dict,
+    *,
+    reason: str,
+    progress: "ProgressReporter | None" = None,
+    already_answered: bool = False,
+) -> bool:
+    """When copy-remux is impossible, pack sheet + original as a file album."""
+    if not already_answered:
+        with contextlib.suppress(Exception):
+            await event.answer("无法无损封装，改为按文件合并")
+    sheet_file = offer.get("sheet_path")
+    sheet = str(sheet_file) if sheet_file and Path(sheet_file).exists() else None
+    if progress is None:
+        progress = ProgressReporter(event.client, offer["chat_id"], event.message_id)
+        await progress.show_now("pack", 0, 1)
+    else:
+        progress.report("pack", 0, 1)
+        await progress.show_now("pack", 0, 1)
+    note = reason.rstrip("。．. ") + "。改为按文件合并发送。"
+    with contextlib.suppress(Exception):
+        await event.edit(note, buttons=None)
+    sent_ok = await _send_pack_album(
+        event.client,
+        offer["chat_id"],
+        sheet,
+        offer["source"],
+        result_msg=offer.get("result"),
+        as_files=True,
+        progress=progress,
+    )
+    if sent_ok:
+        await progress.finish("无法转成可播放视频，已按文件合并成一条，可长按转发。")
+    else:
+        await progress.finish(note + " 文件合并也失败了，请稍后重试。")
+    return sent_ok
+
+
 def _drop_pack_offer(token: str) -> dict | None:
     offer = _pack_offers.pop(token, None)
     if offer and offer.get("keep_dir"):
@@ -976,7 +1016,7 @@ async def _offer_pack_forward(
     result_msg: Any,
     sheet_path: Path | None = None,
     queue: "JobQueue | None" = None,
-    remux_max_mb: int = 80,
+    remux_max_mb: int = 1024,
 ) -> None:
     if result_msg is None or source_msg is None:
         return
@@ -1025,16 +1065,26 @@ async def _offer_pack_forward(
 
 
 async def _remux_pack_and_send(event: events.CallbackQuery.Event, offer: dict, token: str) -> None:
-    remux_max_mb = int(offer.get("remux_max_mb") or 80)
+    remux_max_mb = int(offer.get("remux_max_mb") or 1024)
     file_size = int(offer.get("file_size") or 0)
     limit = remux_max_mb * 1024 * 1024
     if file_size <= 0 or file_size > limit:
-        await event.answer("超出无损封装大小上限", alert=True)
-        with contextlib.suppress(Exception):
-            await event.edit(
-                f"这个文件超过 {remux_max_mb}MB，只做无损封装、不重新压缩。",
-                buttons=None,
-            )
+        await _fallback_merge_as_files(
+            event,
+            offer,
+            reason=f"这个文件超过 {remux_max_mb}MB，不能无损封装",
+        )
+        _drop_pack_offer(token)
+        return
+    keep_dir_probe = offer.get("keep_dir")
+    disk_root = Path(keep_dir_probe) if keep_dir_probe else Path(tempfile.gettempdir())
+    free = shutil.disk_usage(disk_root).free
+    if free < int(file_size * 2.2) + 64 * 1024 * 1024:
+        await _fallback_merge_as_files(
+            event,
+            offer,
+            reason="磁盘空间不够，不能无损封装",
+        )
         _drop_pack_offer(token)
         return
     await event.answer("开始无损封装，请稍候")
@@ -1069,9 +1119,17 @@ async def _remux_pack_and_send(event: events.CallbackQuery.Event, offer: dict, t
         streams = await asyncio.to_thread(probe_streams, src_path)
         ok, reason = evaluate_copy_remux(streams)
         if not ok:
-            await progress.finish(reason)
+            await _fallback_merge_as_files(
+                event,
+                offer,
+                reason=reason,
+                progress=progress,
+                already_answered=True,
+            )
             return
         await asyncio.to_thread(remux_copy_mp4, src_path, dst_path)
+        with contextlib.suppress(OSError):
+            src_path.unlink()
         await progress.show_now("pack_media", 0, max(1, dst_path.stat().st_size))
         album: list[str] = []
         if sheet_file and Path(sheet_file).exists():
@@ -1102,12 +1160,24 @@ async def _remux_pack_and_send(event: events.CallbackQuery.Event, offer: dict, t
             except Exception:
                 logging.exception("remux video send failed")
         if not sent_ok:
-            await progress.finish("封装成功但发送失败，请稍后重试。")
+            await _fallback_merge_as_files(
+                event,
+                offer,
+                reason="封装后的视频发送失败",
+                progress=progress,
+                already_answered=True,
+            )
             return
         await progress.finish("已封装为可播放视频并合并发送。")
     except Exception:
         logging.exception("remux-pack crashed")
-        await progress.finish("无损封装失败，这个文件不能直接复制进可播放格式。")
+        await _fallback_merge_as_files(
+            event,
+            offer,
+            reason="无损封装失败，不能直接复制进可播放格式",
+            progress=progress,
+            already_answered=True,
+        )
     finally:
         if joined and queue is not None:
             await queue.leave()
