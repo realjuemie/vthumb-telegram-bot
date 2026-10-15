@@ -32,7 +32,7 @@ Telegram 视频缩略图机器人：按需读取分块，生成 PotPlayer 风格
 ## 功能
 
 - 普通视频和“作为文件发送”的视频均可处理
-- 以文件发送的视频，缩略图完成后可合并成一条文件消息；管理员可将不超过 1024MB 的 H.264+AAC 文件无损封装成可播放视频（不能封装则仍按文件合并）
+- 以文件发送的视频，缩略图完成后可把缩略图和原文件合并成一条文件消息
 - MTProto 分块读取，不受 Bot API `getFile` 的 20MB 下载限制
 - 512KB 对齐的 HTTP Range 读取
 - LRU 内存缓存 + 任务级临时磁盘缓存，内存淘汰后仍不会重复下载
@@ -360,7 +360,7 @@ HTTPS_PROXY=http://host.docker.internal:7897
 | `HARD_SOURCE_FETCH_RATIO` | `0.55` | 大视频最大读取比例硬上限 |
 | `MIN_SOURCE_FETCH_MB` | `32` | 大视频初始读取预算下限 |
 | `SMALL_FILE_FULL_READ_MB` | `64` | 小文件兼容阈值，范围读取可按需扩展到整个文件 |
-| `REMUX_MAX_MB` | `1024` | 文件视频无损封装大小上限；超出则拒绝，不重新压缩 |
+| `REMUX_MAX_MB` | `1024` | 已停用。文件视频不再转成可播放媒体，只按原文件合并 |
 | `SOURCE_FETCH_GROWTH_MB` | `16` | 预算每次自适应增加的容量 |
 | `MT_PROXY_URL` | 空 | MTProto HTTP / SOCKS5 代理 |
 | `DEBIAN_MIRROR` | 空 | Docker 构建 Debian 镜像地址 |

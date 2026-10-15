@@ -6,13 +6,15 @@ import logging
 import secrets
 import shutil
 import subprocess
+import socket
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 from telethon import Button, TelegramClient, events, functions, types
-from telethon.sessions import MemorySession
+from telethon.network.connection.tcpfull import ConnectionTcpFull
+from telethon.sessions import SQLiteSession
 
 from .access_control import AccessControl
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
@@ -36,6 +38,37 @@ from .vthumb import (
 
 
 VIDEO_MIME_PREFIX = "video/"
+UPLOAD_PART_SIZE_KB = 512
+
+
+class ConnectionTcpKeepalive(ConnectionTcpFull):
+    """Keep NAT from dropping long Telegram uploads (~90s idle reset)."""
+
+    async def _connect(self, timeout=None, ssl=None):
+        await super()._connect(timeout=timeout, ssl=ssl)
+        sock = self._writer.get_extra_info("socket") if self._writer else None
+        if sock is None:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+        if idle is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, idle, 20)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+
+
+def _install_fast_upload(client: TelegramClient) -> None:
+    original = client.upload_file
+
+    async def upload_file(file, *args, part_size_kb=None, **kwargs):
+        if part_size_kb is None:
+            part_size_kb = UPLOAD_PART_SIZE_KB
+        return await original(file, *args, part_size_kb=part_size_kb, **kwargs)
+
+    client.upload_file = upload_file  # type: ignore[method-assign]
+
 BOT_COMMANDS = (
     ("start", "开始使用并查看视频发送方式"),
     ("help", "查看使用说明和自适应读取策略"),
@@ -242,7 +275,6 @@ async def handle_command(
                 "5. 已读取分块会临时缓存，任务结束后自动删除。\n"
                 "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
                 "7. 以文件发送的视频，缩略图完成后可合并成一条文件消息。"
-                f"管理员可将不超过 {settings.remux_max_mb}MB 的 H.264+AAC 文件无损封装成可播放视频。"
             )
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
@@ -884,14 +916,7 @@ def _is_file_sent_video(message: Any) -> bool:
 
 
 def pack_offer_prompt(is_file_video: bool, remux_max_mb: int, *, allow_remux: bool = False) -> str:
-    if is_file_video and allow_remux:
-        return (
-            "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
-            "要不要无损封装成可播放视频，再和缩略图合并成一条？\n"
-            "只复制封装、不重新压缩，需要视频是 H.264、音频是 AAC（或无音轨），"
-            f"且不超过 {remux_max_mb}MB。\n"
-            "如果不能无损封装，会改成按文件合并成一条。"
-        )
+    del remux_max_mb, allow_remux
     if is_file_video:
         return (
             "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
@@ -1035,7 +1060,6 @@ async def _offer_pack_forward(
         kept = keep_dir / Path(sheet_path).name
         shutil.copy2(sheet_path, kept)
     is_file_video = _is_file_sent_video(source_msg)
-    can_remux = bool(allow_remux and is_file_video)
     _pack_offers[token] = {
         "user_id": source_msg.sender_id,
         "chat_id": source_msg.chat_id,
@@ -1045,28 +1069,20 @@ async def _offer_pack_forward(
         "keep_dir": keep_dir,
         "queue": queue,
         "is_file_video": is_file_video,
-        "allow_remux": can_remux,
+        "allow_remux": False,
         "remux_max_mb": remux_max_mb,
         "file_size": _source_file_size(source_msg),
         "expires": time.time() + PACK_OFFER_TTL_SEC,
     }
-    if can_remux:
-        buttons = [
-            [
-                Button.inline("转成可播放并合并", f"pack:r:{token}".encode()),
-                Button.inline("不用了", f"pack:n:{token}".encode()),
-            ]
+    buttons = [
+        [
+            Button.inline("合并为一条", f"pack:y:{token}".encode()),
+            Button.inline("不用了", f"pack:n:{token}".encode()),
         ]
-    else:
-        buttons = [
-            [
-                Button.inline("合并为一条", f"pack:y:{token}".encode()),
-                Button.inline("不用了", f"pack:n:{token}".encode()),
-            ]
-        ]
+    ]
     await client.send_message(
         source_msg.chat_id,
-        pack_offer_prompt(is_file_video, remux_max_mb, allow_remux=can_remux),
+        pack_offer_prompt(is_file_video, remux_max_mb),
         buttons=buttons,
         reply_to=getattr(result_msg, "id", None),
     )
@@ -1216,16 +1232,7 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
             await event.edit("好的，保持分开发送。")
         return
     if action == "r":
-        if not offer.get("allow_remux"):
-            await _fallback_merge_as_files(
-                event,
-                offer,
-                reason="封装仅管理员可用",
-            )
-            _drop_pack_offer(token)
-            return
-        await _remux_pack_and_send(event, offer, token)
-        return
+        action = "y"
     source = offer["source"]
     result = offer["result"]
     source_is_file = getattr(source, "video", None) is None
@@ -1318,11 +1325,33 @@ def _fmt_mb(n: int) -> str:
     return f"{n / (1024 * 1024):.1f}MB"
 
 
+def _png_to_jpeg(src: Path, dst: Path) -> None:
+    """Turn the sheet into RGB JPEG so Telethon/Pillow skips the slow PNG re-encode."""
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(src),
+            "-q:v",
+            "2",
+            str(dst),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def format_progress(stage: str, current: int, total: int) -> str:
     labels = {
         "metadata": "正在读取视频信息",
         "frames": "正在截取视频帧",
         "compose": "正在合成缩略图",
+        "prepare_upload": "正在准备上传图片",
         "upload": "正在上传成品图片",
         "pack": "正在以文件形式发送（图片+原视频）",
         "pack_media": "正在合并为一条媒体消息",
@@ -1609,12 +1638,24 @@ async def process_message(
                 theme=THEME_BY_NAME[theme],
                 progress_callback=progress.report,
             )
-            output_size = output.stat().st_size
+            send_path = output
+            caption_name = f"{source.filename}.png"
+            if delivery != DELIVERY_FILE:
+                jpeg = output.with_suffix(".jpg")
+                await progress.show_now("prepare_upload", 0, 1)
+                try:
+                    await asyncio.to_thread(_png_to_jpeg, output, jpeg)
+                    if jpeg.is_file() and jpeg.stat().st_size > 0:
+                        send_path = jpeg
+                        caption_name = f"{source.filename}.jpg"
+                except Exception:
+                    logging.warning("sheet jpeg convert failed, uploading png", exc_info=True)
+            output_size = send_path.stat().st_size
             await progress.show_now("upload", 0, output_size)
             sent = await client.send_file(
                 chat_id,
-                str(output),
-                caption=f"{source.filename}.png",
+                str(send_path),
+                caption=caption_name,
                 force_document=delivery == DELIVERY_FILE,
                 reply_to=message_id,
                 parse_mode=None,
@@ -1631,7 +1672,6 @@ async def process_message(
                     output,
                     queue=queue,
                     remux_max_mb=settings.remux_max_mb,
-                    allow_remux=bool(access and access.is_admin(message.sender_id)),
                 )
             if access is not None and forward is not None:
                 await _forward_note_success(client, access, forward, message, output)
@@ -1676,13 +1716,21 @@ async def poll() -> None:
     configure_logging(settings.bot_token)
     access = AccessControl(Path(settings.access_file), settings.admin_ids, open_access=settings.open_access)
     preferences = UserPreferences(Path(settings.preferences_file))
+    session_path = Path(settings.access_file).with_name("mtproto")
+    session = SQLiteSession(str(session_path))
+    # DC1 is much faster for 512KB chunk reads than a fresh login on DC5.
+    if not session.auth_key:
+        session.set_dc(1, "149.154.175.53", 443)
     mt_client = TelegramClient(
-        MemorySession(),
+        session,
         settings.api_id,
         settings.api_hash,
         proxy=settings.mt_proxy,
         receive_updates=True,
+        connection=ConnectionTcpKeepalive,
+        auto_reconnect=True,
     )
+    _install_fast_upload(mt_client)
     media_server = MTProtoRangeServer(
         mt_client,
         cache_bytes=settings.range_cache_mb * 1024 * 1024,
@@ -1766,7 +1814,10 @@ async def poll() -> None:
         await mt_client.start(bot_token=settings.bot_token)
         await set_bot_commands(mt_client)
         await media_server.start()
-        logging.info("vthumb Telegram bot started with MTProto range reading.")
+        logging.info(
+            "vthumb Telegram bot started with MTProto range reading. upload_part_size_kb=%s tcp_keepalive=on",
+            UPLOAD_PART_SIZE_KB,
+        )
         await mt_client.run_until_disconnected()
     finally:
         if tasks:

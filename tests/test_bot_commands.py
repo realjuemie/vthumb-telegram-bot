@@ -153,12 +153,11 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         )()
         self.assertEqual(_merge_classify(message), "file_video")
 
-    def test_file_video_pack_prompt_mentions_remux_not_plain_merge(self) -> None:
+    def test_file_video_pack_prompt_is_file_merge_not_remux(self) -> None:
         text = pack_offer_prompt(True, 80, allow_remux=True)
-        self.assertIn("无损封装", text)
-        self.assertIn("80MB", text)
-        self.assertIn("按文件合并", text)
-        self.assertNotIn("方便转发", text)
+        self.assertNotIn("无损封装", text)
+        self.assertNotIn("可播放", text)
+        self.assertIn("文件形式", text)
 
     def test_file_video_pack_prompt_hides_remux_for_non_admin(self) -> None:
         text = pack_offer_prompt(True, 80, allow_remux=False)
