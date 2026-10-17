@@ -17,9 +17,11 @@ from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions import SQLiteSession
 
 from .access_control import AccessControl
+from .announce import Audience, announce_body, collect_recipients
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
 from .settings import Settings
+from .task_log import TaskLog, content_key, file_key
 from .user_preferences import (
     DELIVERY_FILE,
     DELIVERY_MEDIA,
@@ -75,9 +77,11 @@ BOT_COMMANDS = (
     ("status", "查看缩略图设置和读取预算"),
     ("setting", "选择每个用户独立的缩略图预设"),
     ("id", "查看自己的 Telegram 用户 ID"),
+    ("info", "查看账号、授权状态和今日剩余次数"),
     ("add", "管理员：添加授权用户"),
     ("del", "管理员：删除授权用户"),
     ("users", "管理员：查看授权用户"),
+    ("announce", "管理员：预览并发布 Markdown 公告"),
     ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
 )
 
@@ -139,6 +143,83 @@ def command_name(text: str | None) -> str | None:
 
 def permission_message(user_id: int | None) -> str:
     return f"你还没有使用权限。\n你的 Telegram ID：{user_id or '未知'}\n请将此 ID 提供给管理员添加。"
+
+
+def quota_message(limit: int, community_url: str) -> str:
+    text = f"今天的 {limit} 次生成已经用完。\n请通过社群群聊联系开发者升级权限。"
+    if community_url:
+        text += f"\n{community_url}"
+    return text
+
+
+_audience: Audience | None = None
+_announce_wait: set[int] = set()
+_announce_drafts: dict[str, dict] = {}
+ANNOUNCE_HINT = (
+    "请发送公告内容。支持 Markdown：\n"
+    "**粗体**、__斜体__、`代码`、[文字](链接)"
+)
+
+
+async def _show_announce_preview(client: TelegramClient, admin_id: int, chat_id: int, text: str, reply_to: int) -> None:
+    if len(text) > 4000:
+        await client.send_message(chat_id, "公告太长，请控制在 4000 字以内。", reply_to=reply_to)
+        return
+    token = secrets.token_hex(4)
+    _announce_drafts[token] = {"admin_id": admin_id, "chat_id": chat_id, "text": text}
+    _announce_wait.discard(admin_id)
+    try:
+        await client.send_message(
+            chat_id,
+            "公告预览，确认后才会发给用户。\n\n" + text,
+            parse_mode="md",
+            link_preview=False,
+            buttons=[[
+                Button.inline("确认发布", f"ann:y:{token}".encode()),
+                Button.inline("重新编辑", f"ann:e:{token}".encode()),
+            ]],
+            reply_to=reply_to,
+        )
+    except Exception as exc:
+        _announce_drafts.pop(token, None)
+        await client.send_message(
+            chat_id,
+            f"Markdown 无法预览，请修改后再发。\n{type(exc).__name__}: {exc}",
+            reply_to=reply_to,
+        )
+
+
+async def _begin_announce(client: TelegramClient, message: Any) -> None:
+    body = announce_body(message.raw_text)
+    if not body:
+        if message.sender_id:
+            _announce_wait.add(message.sender_id)
+        await client.send_message(message.chat_id, ANNOUNCE_HINT, reply_to=message.id)
+        return
+    await _show_announce_preview(client, message.sender_id, message.chat_id, body, message.id)
+
+
+def _announce_edit_text(message: Any) -> str | None:
+    if extract_video(message) is not None:
+        return None
+    text = (getattr(message, "raw_text", None) or "").strip()
+    if not text or text.startswith("/"):
+        return None
+    return text
+
+
+async def _publish_announce(client: TelegramClient, text: str, recipients: list[int]) -> tuple[int, int]:
+    sent = 0
+    failed = 0
+    for user_id in recipients:
+        try:
+            await client.send_message(user_id, text, parse_mode="md", link_preview=False)
+            sent += 1
+        except Exception:
+            logging.warning("announce delivery failed for %s", user_id, exc_info=True)
+            failed += 1
+        await asyncio.sleep(0.05)
+    return sent, failed
 
 
 def command_user_id(text: str) -> int | None:
@@ -242,6 +323,7 @@ async def handle_command(
     message: Any,
     queue: "JobQueue | None" = None,
     forward: "ForwardGate | None" = None,
+    task_log: "TaskLog | None" = None,
 ) -> bool:
     command = command_name(message.raw_text)
     if command is None:
@@ -268,18 +350,41 @@ async def handle_command(
                 "使用说明：\n"
                 "1. 直接发送视频，或将视频作为文件发送。\n"
                 "2. 使用 /setting 选择帧数与横竖布局。\n"
-                f"3. {settings.small_file_full_read_mb}MB 以内按需读取，必要时可读取完整范围。\n"
-                f"4. 大视频初始读取预算 {settings.max_source_fetch_ratio:.0%}，"
+                "3. 使用 /info 查看账号、授权状态和今日剩余次数。\n"
+                f"4. {settings.small_file_full_read_mb}MB 以内按需读取，必要时可读取完整范围。\n"
+                f"5. 大视频初始读取预算 {settings.max_source_fetch_ratio:.0%}，"
                 f"按需提升至 {settings.hard_source_fetch_ratio:.0%}，"
                 f"且不超过 {settings.max_source_fetch_mb}MB。\n"
-                "5. 已读取分块会临时缓存，任务结束后自动删除。\n"
-                "6. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
-                "7. 以文件发送的视频，缩略图完成后可合并成一条文件消息。"
+                "6. 已读取分块会临时缓存，任务结束后自动删除。\n"
+                "7. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
+                "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。"
             )
             if is_admin:
-                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users"
+                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/announce 公告内容"
+            if not access.has_grant(user_id):
+                text += (
+                    f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
+                    "使用以前的生成结果不计入次数。"
+                )
     elif command == "id":
         text = f"你的 Telegram ID：{user_id or '未知'}"
+    elif command == "info":
+        sender = getattr(message, "sender", None)
+        if sender is None and hasattr(message, "get_sender"):
+            try:
+                sender = await message.get_sender()
+            except Exception:
+                sender = None
+        used = task_log.used_today(user_id) if task_log is not None and user_id is not None else 0
+        limit = task_log.daily_limit if task_log is not None else settings.guest_daily_limit
+        text = account_info_text(
+            sender,
+            user_id,
+            granted=access.has_grant(user_id),
+            is_admin=is_admin,
+            used=used,
+            limit=limit,
+        )
     elif command == "status":
         if not is_allowed:
             text = permission_message(user_id)
@@ -337,6 +442,12 @@ async def handle_command(
             return True
         await _forward_handle_command(client, access, forward, message)
         return True
+    elif command == "announce":
+        if not is_admin:
+            text = "此命令仅限管理员使用。"
+        else:
+            await _begin_announce(client, message)
+            return True
     else:
         text = "未知命令，请使用 /help 查看可用命令。"
     await client.send_message(message.chat_id, text, reply_to=message.id, buttons=buttons)
@@ -736,6 +847,42 @@ class ForwardGate:
             self.enabled = enabled
             self._save()
             return changed
+
+
+def account_info_text(
+    sender: Any,
+    user_id: int | None,
+    *,
+    granted: bool,
+    is_admin: bool,
+    used: int,
+    limit: int,
+) -> str:
+    name = ""
+    username = None
+    if sender is not None:
+        username = getattr(sender, "username", None)
+        first = (getattr(sender, "first_name", None) or "").strip()
+        last = (getattr(sender, "last_name", None) or "").strip()
+        name = " ".join(part for part in (first, last) if part)
+    lines = [
+        "账号信息",
+        f"名字：{name or '未设置'}",
+        f"用户名：@{username}" if username else "用户名：无",
+        f"Telegram ID：{user_id or '未知'}",
+    ]
+    if is_admin:
+        lines.append("授权用户：是（管理员）")
+        lines.append("今日剩余次数：不限")
+    elif granted:
+        lines.append("授权用户：是")
+        lines.append("今日剩余次数：不限")
+    else:
+        remaining = max(int(limit) - int(used), 0)
+        lines.append("授权用户：否")
+        lines.append(f"今日剩余次数：{remaining}/{limit}")
+        lines.append("使用以前的生成记录不计入次数。")
+    return "\n".join(lines)
 
 
 def format_user_label(sender: Any, user_id: int | None) -> str:
@@ -1579,6 +1726,69 @@ def user_error_message(exc: Exception) -> str:
     return "生成失败，请查看容器日志中的错误类型。"
 
 
+_reuse_offers: dict[str, dict] = {}
+REUSE_TTL_SEC = 60 * 60
+
+
+def _drop_reuse_offer(token: str) -> dict | None:
+    return _reuse_offers.pop(token, None)
+
+
+def _purge_reuse_offers() -> None:
+    now = time.time()
+    expired = [key for key, item in _reuse_offers.items() if item.get("expires", 0) < now]
+    for key in expired:
+        _drop_reuse_offer(key)
+
+
+async def _offer_previous_result(client: TelegramClient, message: Any, record: dict, key: str) -> None:
+    _purge_reuse_offers()
+    token = secrets.token_hex(4)
+    _reuse_offers[token] = {
+        "user_id": message.sender_id,
+        "message": message,
+        "record": record,
+        "file_key": key,
+        "expires": time.time() + REUSE_TTL_SEC,
+    }
+    await client.send_message(
+        message.chat_id,
+        "这个视频已经有生成记录，别人生成过的也可以用。\n要合并转发之前的图片和视频，还是重新生成？",
+        buttons=[[
+            Button.inline("使用之前的", f"reuse:y:{token}".encode()),
+            Button.inline("重新生成", f"reuse:n:{token}".encode()),
+        ]],
+        reply_to=message.id,
+    )
+
+
+async def _saved_message(client: TelegramClient, chat_id: int, message_id: int):
+    found = await client.get_messages(int(chat_id), ids=int(message_id))
+    if isinstance(found, list):
+        return found[0] if found else None
+    return found
+
+
+async def _forward_saved_result(client: TelegramClient, chat_id: int, record: dict) -> bool:
+    """Send the saved sheet and source video as one album, including another user's result."""
+    try:
+        image = await _saved_message(client, record["image_chat_id"], record["image_message_id"])
+        video = await _saved_message(client, record["source_chat_id"], record["source_message_id"])
+    except Exception:
+        logging.warning("saved result lookup failed", exc_info=True)
+        return False
+    if image is None or video is None:
+        return False
+    if await _send_pack_album(client, chat_id, None, video, result_msg=image, as_files=False):
+        return True
+    try:
+        await client.send_file(chat_id, [image, video], force_document=True)
+        return True
+    except Exception:
+        logging.warning("saved result album failed", exc_info=True)
+        return False
+
+
 async def process_message(
     client: TelegramClient,
     media_server: MTProtoRangeServer,
@@ -1588,6 +1798,7 @@ async def process_message(
     message: Any,
     access: AccessControl | None = None,
     forward: "ForwardGate | None" = None,
+    task_log: TaskLog | None = None,
 ) -> None:
     chat_id = message.chat_id
     message_id = message.id
@@ -1664,6 +1875,16 @@ async def process_message(
             await progress.finish("处理完成，缩略图已发送。")
             if isinstance(sent, list):
                 sent = sent[0] if sent else None
+            saved_key = file_key(message)
+            if task_log is not None and saved_key and sent is not None and getattr(sent, "id", None):
+                task_log.remember(
+                    saved_key,
+                    source_chat_id=chat_id,
+                    source_message_id=message_id,
+                    image_chat_id=getattr(sent, "chat_id", None) or chat_id,
+                    image_message_id=sent.id,
+                    content_key=content_key(message),
+                )
             with contextlib.suppress(Exception):
                 await _offer_pack_forward(
                     client,
@@ -1737,33 +1958,161 @@ async def poll() -> None:
     )
     queue = JobQueue(settings.max_concurrent_jobs)
     forward = ForwardGate(Path(settings.access_file).with_name("forward.json"))
+    task_log = TaskLog(
+        Path(settings.access_file).with_name("task_log.json"),
+        daily_limit=settings.guest_daily_limit,
+    )
+    global _audience
+    _audience = Audience(Path(settings.access_file).with_name("audience.json"))
+    _audience.add_many(access.admin_ids)
+    _audience.add_many(access.users())
+    _audience.add_many(preferences.known_user_ids())
+    _audience.add_many(task_log.known_user_ids())
     tasks: set[asyncio.Task[None]] = set()
+
+    def _start_generation(message: Any) -> None:
+        user_id = message.sender_id
+        if user_id is not None and not access.has_grant(user_id):
+            task_log.consume(user_id)
+        task = asyncio.create_task(
+            process_message(
+                mt_client, media_server, settings, preferences, queue, message,
+                access=access, forward=forward, task_log=task_log,
+            )
+        )
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     @mt_client.on(events.NewMessage(incoming=True))
     async def on_message(event: events.NewMessage.Event) -> None:
-        if await handle_command(mt_client, settings, access, preferences, event.message, queue=queue, forward=forward):
+        if event.sender_id and _audience is not None:
+            _audience.note(event.sender_id)
+        if await handle_command(
+            mt_client, settings, access, preferences, event.message,
+            queue=queue, forward=forward, task_log=task_log,
+        ):
             return
+        if event.sender_id in _announce_wait:
+            edited = _announce_edit_text(event.message)
+            if edited:
+                _announce_wait.discard(event.sender_id)
+                await _show_announce_preview(
+                    mt_client, event.sender_id, event.chat_id, edited, event.message.id
+                )
+                return
         # /merge short-circuit: if a merge session is active for this
         # sender, collect the media and DO NOT process_message() it.
         if await _merge_collect_media(
             mt_client, settings, access, preferences, event.message
         ):
             return
-        if not access.is_allowed(event.sender_id):
+        video = extract_video(event.message)
+        if video is None:
+            if not access.is_allowed(event.sender_id):
+                await mt_client.send_message(
+                    event.chat_id,
+                    permission_message(event.sender_id),
+                    reply_to=event.message.id,
+                )
+                return
+            task = asyncio.create_task(
+                process_message(
+                    mt_client, media_server, settings, preferences, queue, event.message,
+                    access=access, forward=forward, task_log=task_log,
+                )
+            )
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return
+        key = file_key(event.message)
+        record = task_log.lookup(key, content_key(event.message))
+        if record:
+            await _offer_previous_result(mt_client, event.message, record, key or "")
+            return
+        if not access.has_grant(event.sender_id) and not task_log.can_generate(event.sender_id):
             await mt_client.send_message(
                 event.chat_id,
-                permission_message(event.sender_id),
+                quota_message(settings.guest_daily_limit, settings.community_url),
                 reply_to=event.message.id,
             )
             return
-        task = asyncio.create_task(
-            process_message(
-                mt_client, media_server, settings, preferences, queue, event.message,
-                access=access, forward=forward,
-            )
+        _start_generation(event.message)
+
+    @mt_client.on(events.CallbackQuery(pattern=b"^reuse:"))
+    async def on_reuse(event: events.CallbackQuery.Event) -> None:
+        raw = (event.data or b"").decode("utf-8", "replace")
+        parts = raw.split(":")
+        if len(parts) != 3 or parts[0] != "reuse" or parts[1] not in {"y", "n"}:
+            await event.answer("按钮已失效。", alert=True)
+            return
+        action, token = parts[1], parts[2]
+        offer = _reuse_offers.get(token)
+        if offer is None or offer.get("expires", 0) < time.time():
+            _drop_reuse_offer(token)
+            await event.answer("这条询问已过期。", alert=True)
+            return
+        if event.sender_id != offer["user_id"]:
+            await event.answer("这不是你的任务。", alert=True)
+            return
+        message = offer["message"]
+        if action == "y":
+            _drop_reuse_offer(token)
+            ok = await _forward_saved_result(mt_client, message.chat_id, offer["record"])
+            await event.answer("已转发" if ok else "转发失败")
+            with contextlib.suppress(Exception):
+                await event.edit(
+                    "已把之前的图片和视频合并成一条发给你。这次不计入生成次数。"
+                    if ok
+                    else "之前的记录已失效，无法转发。可以再发一次并选择重新生成。"
+                )
+            return
+        if not access.has_grant(message.sender_id) and not task_log.can_generate(message.sender_id):
+            await event.answer("今天的次数已用完", alert=True)
+            with contextlib.suppress(Exception):
+                await event.edit(quota_message(settings.guest_daily_limit, settings.community_url), buttons=None)
+            return
+        _drop_reuse_offer(token)
+        await event.answer("开始重新生成")
+        with contextlib.suppress(Exception):
+            await event.edit("好的，重新生成。", buttons=None)
+        _start_generation(message)
+
+    @mt_client.on(events.CallbackQuery(pattern=b"^ann:"))
+    async def on_announce(event: events.CallbackQuery.Event) -> None:
+        raw = (event.data or b"").decode("utf-8", "replace")
+        parts = raw.split(":")
+        if len(parts) != 3 or parts[0] != "ann" or parts[1] not in {"y", "e"}:
+            await event.answer("按钮已失效。", alert=True)
+            return
+        action, token = parts[1], parts[2]
+        draft = _announce_drafts.get(token)
+        if draft is None or event.sender_id != draft.get("admin_id") or not access.is_admin(event.sender_id):
+            await event.answer("这不是你的公告。", alert=True)
+            return
+        if action == "e":
+            _announce_drafts.pop(token, None)
+            _announce_wait.add(event.sender_id)
+            await event.answer("请发送新内容")
+            with contextlib.suppress(Exception):
+                await event.edit(ANNOUNCE_HINT, buttons=None)
+            return
+        text = draft["text"]
+        publisher = draft["admin_id"]
+        _announce_drafts.pop(token, None)
+        recipients = collect_recipients(
+            _audience.ids() if _audience is not None else [],
+            access.users(),
+            access.admin_ids,
+            preferences.known_user_ids(),
+            task_log.known_user_ids(),
         )
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
+        recipients = [user_id for user_id in recipients if user_id != publisher]
+        await event.answer("开始发布")
+        with contextlib.suppress(Exception):
+            await event.edit("正在发布公告…", buttons=None)
+        sent, failed = await _publish_announce(mt_client, text, recipients)
+        with contextlib.suppress(Exception):
+            await event.edit(f"公告已发布。成功 {sent} 人，失败 {failed} 人。")
 
     @mt_client.on(events.CallbackQuery(pattern=b"^pack:"))
     async def on_pack_offer(event: events.CallbackQuery.Event) -> None:

@@ -24,6 +24,8 @@ def make_settings() -> Settings:
         open_access=False,
         access_file="access.json",
         preferences_file="preferences.json",
+        guest_daily_limit=10,
+        community_url="",
     )
 
 

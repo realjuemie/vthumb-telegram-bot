@@ -33,6 +33,12 @@ class AccessControl:
             return True
         return self.is_admin(user_id) or user_id in self.user_ids
 
+    def has_grant(self, user_id: int | None) -> bool:
+        """Explicit admin or allow-list membership. Open access does not count."""
+        if user_id is None:
+            return False
+        return self.is_admin(user_id) or user_id in self.user_ids
+
     def users(self) -> list[int]:
         return sorted(self.user_ids)
 

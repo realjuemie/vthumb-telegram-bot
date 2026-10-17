@@ -97,6 +97,9 @@ class UserPreferences:
             return DEFAULT_THEME
         return self.theme_modes.get(user_id, DEFAULT_THEME)
 
+    def known_user_ids(self) -> set[int]:
+        return set(self.values) | set(self.delivery_modes) | set(self.theme_modes)
+
     async def set(self, user_id: int, count: int, cols: int) -> ThumbnailPreset:
         preset = PRESETS_BY_KEY.get((count, cols))
         if not preset:

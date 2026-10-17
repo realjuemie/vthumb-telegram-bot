@@ -4,6 +4,7 @@ import unittest
 from app.bot import (
     BOT_COMMANDS,
     JobQueue,
+    account_info_text,
     command_name,
     command_user_id,
     delivery_from_callback,
@@ -19,7 +20,15 @@ from app.bot import (
 
 
 class BotCommandTests(unittest.TestCase):
-    def test_extracts_plain_command(self) -> None:
+    def test_info_shows_guest_remaining_and_grant(self) -> None:
+        sender = type("U", (), {"username": "ada", "first_name": "Ada", "last_name": None})()
+        guest = account_info_text(sender, 7, granted=False, is_admin=False, used=3, limit=10)
+        self.assertIn("授权用户：否", guest)
+        self.assertIn("今日剩余次数：7/10", guest)
+        self.assertIn("@ada", guest)
+        admin = account_info_text(sender, 1, granted=True, is_admin=True, used=9, limit=10)
+        self.assertIn("授权用户：是（管理员）", admin)
+        self.assertIn("今日剩余次数：不限", admin)
         self.assertEqual(command_name("/status"), "status")
 
     def test_extracts_addressed_command(self) -> None:

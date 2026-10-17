@@ -50,6 +50,8 @@ class Settings:
     open_access: bool
     access_file: str
     preferences_file: str
+    guest_daily_limit: int
+    community_url: str
 
     @property
     def mt_proxy(self) -> dict[str, object] | None:
@@ -114,4 +116,6 @@ class Settings:
             open_access=_bool_env("OPEN_ACCESS", False),
             access_file=os.getenv("ACCESS_FILE", "/data/access.json"),
             preferences_file=os.getenv("PREFERENCES_FILE", "/data/preferences.json"),
+            guest_daily_limit=_int_env("GUEST_DAILY_LIMIT", 10),
+            community_url=(os.getenv("COMMUNITY_URL") or "").strip(),
         )
