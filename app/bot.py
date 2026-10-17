@@ -1988,6 +1988,13 @@ class ProgressReporter:
             await self.task
         await self._edit(text)
 
+    async def dismiss(self) -> None:
+        self.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.task
+        with contextlib.suppress(Exception):
+            await self.client.delete_messages(self.chat_id, [self.message_id])
+
     async def _run(self) -> None:
         while True:
             await asyncio.sleep(1.2)
@@ -2276,7 +2283,10 @@ async def process_message(
                     parse_mode=None,
                     progress_callback=lambda current, total: progress.report("upload", current, total),
                 )
-            await progress.finish("处理完成，缩略图已发送。")
+            if quote_msg_id:
+                await progress.dismiss()
+            else:
+                await progress.finish("处理完成，缩略图已发送。")
             if isinstance(sent, list):
                 sent = sent[0] if sent else None
             saved_key = file_key(message)
