@@ -66,3 +66,53 @@ class AccessControl:
             encoding="utf-8",
         )
         temporary.replace(self.path)
+
+
+class GroupAccess:
+    """Groups where granted users may request thumbnails."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.chat_ids = self._load()
+        self.lock = asyncio.Lock()
+
+    def _load(self) -> set[int]:
+        if not self.path.exists():
+            return set()
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            chats = payload.get("chats", [])
+            return {int(chat_id) for chat_id in chats}
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError(f"Cannot read group list: {self.path}") from exc
+
+    def is_authorized(self, chat_id: int | None) -> bool:
+        return chat_id is not None and int(chat_id) in self.chat_ids
+
+    def chats(self) -> list[int]:
+        return sorted(self.chat_ids)
+
+    async def add(self, chat_id: int) -> bool:
+        async with self.lock:
+            if chat_id in self.chat_ids:
+                return False
+            self.chat_ids.add(int(chat_id))
+            self._save()
+            return True
+
+    async def remove(self, chat_id: int) -> bool:
+        async with self.lock:
+            if chat_id not in self.chat_ids:
+                return False
+            self.chat_ids.remove(int(chat_id))
+            self._save()
+            return True
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps({"chats": sorted(self.chat_ids)}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)

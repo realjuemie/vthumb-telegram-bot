@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.access_control import AccessControl
+from app.access_control import AccessControl, GroupAccess
 
 
 class AccessControlTests(unittest.IsolatedAsyncioTestCase):
@@ -41,6 +41,18 @@ class AccessControlTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(access.is_allowed(111))
             self.assertTrue(access.is_allowed(123456789))
             self.assertFalse(access.is_allowed(None))
+
+    async def test_group_authorization_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "groups.json"
+            groups = GroupAccess(path)
+            self.assertFalse(groups.is_authorized(-1001))
+            self.assertTrue(await groups.add(-1001))
+            self.assertFalse(await groups.add(-1001))
+            reloaded = GroupAccess(path)
+            self.assertTrue(reloaded.is_authorized(-1001))
+            self.assertTrue(await reloaded.remove(-1001))
+            self.assertFalse(reloaded.is_authorized(-1001))
 
 
 if __name__ == "__main__":

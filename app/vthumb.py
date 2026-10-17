@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
@@ -284,18 +285,29 @@ def extract_frame_sequence(
     name_prefix: str = "frame",
     prefer_accurate: bool = False,
 ) -> tuple[list[Path], list[float]]:
-    frames: list[Path] = []
-    times: list[float] = []
-    for index in range(1, count + 1):
-        timestamp = sample_time(duration, index, count)
-        path = tmp_dir / f"{name_prefix}_{index:03}.jpg"
-        if extract_one_frame(url, timestamp, path, timeout, prefer_accurate=prefer_accurate):
-            frames.append(path)
-            times.append(timestamp)
-        else:
-            logger.warning("no frame at %.3fs (%s/%s)", timestamp, index, count)
-        if progress_callback:
-            progress_callback("frames", index, count)
+    jobs = [
+        (index, sample_time(duration, index, count), tmp_dir / f"{name_prefix}_{index:03}.jpg")
+        for index in range(1, count + 1)
+    ]
+    found: dict[int, tuple[Path, float]] = {}
+    workers = min(4, len(jobs)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {
+            pool.submit(extract_one_frame, url, timestamp, path, timeout, prefer_accurate): (index, timestamp, path)
+            for index, timestamp, path in jobs
+        }
+        done = 0
+        for future in as_completed(future_map):
+            index, timestamp, path = future_map[future]
+            done += 1
+            if future.result():
+                found[index] = (path, timestamp)
+            else:
+                logger.warning("no frame at %.3fs (%s/%s)", timestamp, index, count)
+            if progress_callback:
+                progress_callback("frames", done, count)
+    frames = [found[index][0] for index in sorted(found)]
+    times = [found[index][1] for index in sorted(found)]
     return trim_trailing_duplicates(frames, times)
 
 

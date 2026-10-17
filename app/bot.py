@@ -16,7 +16,7 @@ from telethon import Button, TelegramClient, events, functions, types
 from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions import SQLiteSession
 
-from .access_control import AccessControl
+from .access_control import AccessControl, GroupAccess
 from .announce import Audience, announce_body, collect_recipients
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
@@ -82,6 +82,8 @@ BOT_COMMANDS = (
     ("del", "管理员：删除授权用户"),
     ("users", "管理员：查看授权用户"),
     ("announce", "管理员：预览并发布 Markdown 公告"),
+    ("group", "管理员：在群里授权该群使用缩略图"),
+    ("thumb", "回复一条视频，生成缩略图"),
     ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
 )
 
@@ -197,6 +199,313 @@ async def _begin_announce(client: TelegramClient, message: Any) -> None:
         await client.send_message(message.chat_id, ANNOUNCE_HINT, reply_to=message.id)
         return
     await _show_announce_preview(client, message.sender_id, message.chat_id, body, message.id)
+
+
+def _quote_ids(command: Any) -> tuple[int | None, int | None]:
+    """Message id the command replied to, plus forum topic id when present."""
+    header = getattr(command, "reply_to", None)
+    msg_id = getattr(header, "reply_to_msg_id", None)
+    top_id = getattr(header, "reply_to_top_id", None)
+    return (int(msg_id) if msg_id else None, int(top_id) if top_id else None)
+
+
+def _input_reply(msg_id: int, top_id: int | None = None) -> types.InputReplyToMessage:
+    return types.InputReplyToMessage(
+        reply_to_msg_id=int(msg_id),
+        top_msg_id=int(top_id) if top_id else None,
+    )
+
+
+async def _input_peer(client: TelegramClient, message: Any, chat_id: int):
+    getter = getattr(message, "get_input_chat", None)
+    if getter is not None:
+        try:
+            peer = await getter()
+            if peer is not None:
+                return peer
+        except Exception:
+            logging.warning("group input peer lookup failed", exc_info=True)
+    return await client.get_input_entity(chat_id)
+
+
+async def _send_text_quoting(
+    client: TelegramClient,
+    peer: Any,
+    text: str,
+    msg_id: int,
+    top_id: int | None = None,
+):
+    request = functions.messages.SendMessageRequest(
+        peer=peer,
+        message=text,
+        reply_to=_input_reply(msg_id, top_id),
+    )
+    return client._get_response_message(request, await client(request), peer)
+
+
+async def _send_file_quoting(
+    client: TelegramClient,
+    peer: Any,
+    path: str,
+    *,
+    caption: str,
+    force_document: bool,
+    msg_id: int,
+    top_id: int | None = None,
+    progress_callback=None,
+):
+    _handle, media, _image = await client._file_to_media(
+        path,
+        force_document=force_document,
+        progress_callback=progress_callback,
+    )
+    request = functions.messages.SendMediaRequest(
+        peer=peer,
+        media=media,
+        message=caption or "",
+        reply_to=_input_reply(msg_id, top_id),
+    )
+    return client._get_response_message(request, await client(request), peer)
+
+
+def _is_group_message(message: Any) -> bool:
+    return bool(getattr(message, "is_group", False))
+
+
+def _multipart_body(fields: dict[str, str], file_field: str, filename: str, data: bytes, mime: str) -> tuple[str, bytes]:
+    boundary = "----vthumb" + secrets.token_hex(8)
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode()
+        )
+    chunks.append(
+        (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; "
+            f"filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+        ).encode()
+    )
+    chunks.append(data)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode())
+    return boundary, b"".join(chunks)
+
+
+def _botapi_send_file_sync(
+    token: str,
+    chat_id: int,
+    path: str,
+    *,
+    caption: str,
+    reply_to: int,
+    force_document: bool,
+    thread_id: int | None = None,
+) -> tuple[int | None, bool, str | None]:
+    import json
+    import urllib.error
+    import urllib.request
+
+    method = "sendDocument" if force_document else "sendPhoto"
+    field = "document" if force_document else "photo"
+    suffix = Path(path).suffix.lower()
+    mime = "image/png" if suffix == ".png" else "image/jpeg"
+    fields = {
+        "chat_id": str(chat_id),
+        "caption": caption or "",
+        "reply_parameters": json.dumps({
+            "message_id": int(reply_to),
+            "allow_sending_without_reply": False,
+        }),
+        "parse_mode": "HTML",
+    }
+    if thread_id:
+        fields["message_thread_id"] = str(int(thread_id))
+    boundary, body = _multipart_body(fields, field, Path(path).name, Path(path).read_bytes(), mime)
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode(errors="replace")
+        try:
+            description = json.loads(raw).get("description") or raw
+        except json.JSONDecodeError:
+            description = raw
+        return None, False, str(description)[:300]
+    result = payload.get("result") or {}
+    reply = result.get("reply_to_message") or {}
+    return result.get("message_id"), bool(reply.get("message_id")), None
+
+
+class _BotApiMessage:
+    def __init__(self, chat_id: int, message_id: int, has_reply: bool) -> None:
+        self.chat_id = chat_id
+        self.id = message_id
+        self.reply_to = object() if has_reply else None
+
+
+async def _quote_for_video(client: TelegramClient, video: Any):
+    """Reply target that Telegram will actually keep.
+
+    A forwarded channel post cannot be quoted by its copy in the group.
+    Quote the original channel message instead.
+    """
+    fwd = getattr(video, "fwd_from", None)
+    origin = getattr(fwd, "from_id", None) if fwd else None
+    post_id = getattr(fwd, "channel_post", None) if fwd else None
+    if origin is not None and post_id:
+        try:
+            peer = await client.get_input_entity(origin)
+            return types.InputReplyToMessage(
+                reply_to_msg_id=int(post_id),
+                reply_to_peer_id=peer,
+            )
+        except Exception:
+            logging.warning("could not resolve forwarded video for quote", exc_info=True)
+    msg_id = getattr(video, "id", None)
+    if not msg_id:
+        return None
+    return types.InputReplyToMessage(reply_to_msg_id=int(msg_id))
+
+
+async def _send_media_quoting(
+    client: TelegramClient,
+    chat_id: int,
+    path: str,
+    *,
+    caption: str,
+    force_document: bool,
+    video: Any,
+    progress_callback=None,
+):
+    peer = await client.get_input_entity(chat_id)
+    reply = await _quote_for_video(client, video)
+    text, entities = await client._parse_message_text(caption or "", "html")
+    _handle, media, _image = await client._file_to_media(
+        path,
+        force_document=force_document,
+        progress_callback=progress_callback,
+    )
+    request = functions.messages.SendMediaRequest(
+        peer=peer,
+        media=media,
+        message=text or "",
+        entities=entities,
+        reply_to=reply,
+    )
+    return client._get_response_message(request, await client(request), peer)
+
+
+def _html_mention(user_id: int | None, label: str | None) -> str:
+    if not user_id:
+        return ""
+    name = html.escape((label or str(user_id)).lstrip("@") or str(user_id))
+    return f'<a href="tg://user?id={int(user_id)}">{name}</a>'
+
+
+def _botapi_delete_sync(token: str, chat_id: int, message_id: int) -> None:
+    import json
+    import urllib.request
+
+    body = json.dumps({"chat_id": chat_id, "message_id": message_id}).encode()
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/deleteMessage",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=20):
+        return
+
+
+async def _handle_group_command(
+    client: TelegramClient,
+    access: AccessControl,
+    groups: GroupAccess | None,
+    message: Any,
+) -> None:
+    if not access.is_admin(message.sender_id):
+        await client.send_message(message.chat_id, "此命令仅限管理员使用。", reply_to=message.id)
+        return
+    if not _is_group_message(message):
+        await client.send_message(message.chat_id, "请在要授权的群里发送 /group。", reply_to=message.id)
+        return
+    if groups is None:
+        await client.send_message(message.chat_id, "群授权还没准备好。", reply_to=message.id)
+        return
+    arg = ""
+    parts = (message.raw_text or "").split()
+    if len(parts) > 1:
+        arg = parts[1].lower()
+    chat_id = int(message.chat_id)
+    if arg in {"off", "0", "false", "关"}:
+        removed = await groups.remove(chat_id)
+        text = "已取消这个群的缩略图授权。" if removed else "这个群本来就没有授权。"
+    else:
+        added = await groups.add(chat_id)
+        text = "已授权这个群。授权用户或管理员回复视频并发送 /thumb 即可生成。" if added else "这个群已经授权过了。"
+    await client.send_message(message.chat_id, text, reply_to=message.id)
+
+
+async def _handle_thumb_command(
+    client: TelegramClient,
+    access: AccessControl,
+    groups: GroupAccess | None,
+    task_log: TaskLog | None,
+    message: Any,
+    enqueue,
+) -> None:
+    if not _is_group_message(message):
+        await client.send_message(message.chat_id, "请在已授权的群里回复视频，再发送 /thumb。", reply_to=message.id)
+        return
+    if groups is None or not groups.is_authorized(message.chat_id):
+        await client.send_message(message.chat_id, "这个群还没有授权。请管理员在群里发送 /group。", reply_to=message.id)
+        return
+    if not access.has_grant(message.sender_id):
+        await client.send_message(message.chat_id, "只有授权用户或管理员可以在群里生成缩略图。", reply_to=message.id)
+        return
+    if not getattr(message, "is_reply", False):
+        await client.send_message(message.chat_id, "请回复一条视频，再发送 /thumb。", reply_to=message.id)
+        return
+    try:
+        replied = await message.get_reply_message()
+    except Exception:
+        replied = None
+    if replied is None or extract_video(replied) is None:
+        await client.send_message(message.chat_id, "请回复一条视频，再发送 /thumb。", reply_to=message.id)
+        return
+    if enqueue is None:
+        await client.send_message(message.chat_id, "任务队列还没准备好。", reply_to=message.id)
+        return
+    header_id, quote_top_id = _quote_ids(message)
+    sender = getattr(message, "sender", None)
+    mention_label = format_user_label(sender, message.sender_id)
+    job_kwargs = dict(
+        preference_user_id=message.sender_id,
+        offer_pack=False,
+        quote_msg_id=header_id or getattr(replied, "id", None),
+        quote_top_id=quote_top_id,
+        command_msg_id=message.id,
+        header_msg_id=header_id,
+        mention_user_id=message.sender_id,
+        mention_label=mention_label,
+    )
+    key = file_key(replied)
+    record = task_log.lookup(key, content_key(replied)) if task_log is not None and key else None
+    if record:
+        await _offer_previous_result(
+            client,
+            replied,
+            record,
+            key or "",
+            requester_id=message.sender_id,
+            enqueue_kwargs=job_kwargs,
+            mention_html=_html_mention(message.sender_id, mention_label),
+        )
+        return
+    enqueue(replied, **job_kwargs)
 
 
 def _announce_edit_text(message: Any) -> str | None:
@@ -324,6 +633,8 @@ async def handle_command(
     queue: "JobQueue | None" = None,
     forward: "ForwardGate | None" = None,
     task_log: "TaskLog | None" = None,
+    groups: "GroupAccess | None" = None,
+    enqueue=None,
 ) -> bool:
     command = command_name(message.raw_text)
     if command is None:
@@ -357,10 +668,11 @@ async def handle_command(
                 f"且不超过 {settings.max_source_fetch_mb}MB。\n"
                 "6. 已读取分块会临时缓存，任务结束后自动删除。\n"
                 "7. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
-                "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。"
+                "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。\n"
+                "9. 已授权的群里，回复视频并发送 /thumb。任务和私聊共用队列。"
             )
             if is_admin:
-                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/announce 公告内容"
+                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/announce 公告内容\n/group 在群里授权该群\n/thumb 回复视频生成缩略图"
             if not access.has_grant(user_id):
                 text += (
                     f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
@@ -448,6 +760,12 @@ async def handle_command(
         else:
             await _begin_announce(client, message)
             return True
+    elif command == "group":
+        await _handle_group_command(client, access, groups, message)
+        return True
+    elif command == "thumb":
+        await _handle_thumb_command(client, access, groups, task_log, message, enqueue)
+        return True
     else:
         text = "未知命令，请使用 /help 查看可用命令。"
     await client.send_message(message.chat_id, text, reply_to=message.id, buttons=buttons)
@@ -938,11 +1256,13 @@ async def _forward_note_success(
     gate: ForwardGate,
     message: Any,
     png_path: Path,
+    requester_id: int | None = None,
+    requester_label: str | None = None,
 ) -> None:
     if not gate.enabled:
         return
-    user_id = message.sender_id
-    if user_id is None or access.is_admin(user_id):
+    actor_id = requester_id if requester_id is not None else getattr(message, "sender_id", None)
+    if actor_id is None or access.is_admin(actor_id):
         return
     keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_fwd_"))
     kept: Path | None = None
@@ -957,18 +1277,19 @@ async def _forward_note_success(
     sender = None
     with contextlib.suppress(Exception):
         sender = await message.get_sender()
-    label = format_user_label(sender, user_id)
+    label = requester_label or format_user_label(sender, actor_id)
     state = _pending_forward.setdefault(
-        user_id,
+        actor_id,
         {"items": [], "dirs": [], "label": label, "task": None},
     )
     state["label"] = label
     state["items"].append({"message": message, "png": kept})
     if keep_dir not in state["dirs"]:
         state["dirs"].append(keep_dir)
+    logging.info("%s queued for admin uid=%s", FORWARD_LOG_PREFIX, actor_id)
 
     def _fire():
-        return _forward_flush(client, access, user_id)
+        return _forward_flush(client, access, actor_id)
 
     if state.get("task") and not state["task"].done():
         state["task"].cancel()
@@ -996,43 +1317,23 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
     notice = format_forward_notice(label, user_id, count)
     pngs = [item["png"] for item in items if item.get("png") and Path(item["png"]).exists()]
     videos = [item["message"] for item in items if item.get("message") is not None]
-    from telethon.tl.types import InputMediaDocument, InputDocument
-    album: list = []
-    album.extend(str(path) for path in pngs)
-    for msg in videos:
-        kind = _merge_classify(msg)
-        doc = None
-        if kind == "video":
-            doc = msg.video
-        elif kind == "video_note":
-            doc = msg.video_note
-        elif kind == "animation":
-            doc = msg.animation
-        elif msg.document:
-            doc = msg.document
-        if doc is None:
-            continue
-        album.append(InputMediaDocument(InputDocument(doc.id, doc.access_hash, doc.file_reference)))
-
     for admin_id in sorted(access.admin_ids):
         try:
             await client.send_message(admin_id, notice, parse_mode="html")
         except Exception as exc:
             logging.warning("%s notify admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, type(exc).__name__)
             continue
-        if not album:
+        batch: list = [str(path) for path in pngs]
+        batch.extend(videos)
+        if not batch:
             continue
-        batch_size = 10
-        for start in range(0, len(album), batch_size):
-            batch = album[start:start + batch_size]
-            try:
-                await client.send_file(admin_id, batch, force_document=False)
-            except Exception as exc:
-                logging.warning("%s album to admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, exc)
-                # fallback: send items one by one
-                for piece in batch:
-                    with contextlib.suppress(Exception):
-                        await client.send_file(admin_id, piece, force_document=False)
+        try:
+            await client.send_file(admin_id, batch[:10])
+        except Exception as exc:
+            logging.warning("%s album to admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, exc)
+            for piece in batch:
+                with contextlib.suppress(Exception):
+                    await client.send_file(admin_id, piece)
 
     for directory in state.get("dirs", []):
         shutil.rmtree(directory, ignore_errors=True)
@@ -1570,6 +1871,9 @@ class JobQueue:
         chat_id: int,
         reply_to: int,
         filename: str,
+        *,
+        quote_top_id: int | None = None,
+        peer: Any = None,
     ) -> QueueTicket:
         ticket = QueueTicket(client, chat_id, filename)
         async with self._lock:
@@ -1578,11 +1882,20 @@ class JobQueue:
         try:
             if ahead > 0:
                 try:
-                    msg = await client.send_message(
-                        chat_id,
-                        format_queue_status(ahead, filename),
-                        reply_to=reply_to,
-                    )
+                    if peer is not None:
+                        msg = await _send_text_quoting(
+                            client,
+                            peer,
+                            format_queue_status(ahead, filename),
+                            reply_to,
+                            quote_top_id,
+                        )
+                    else:
+                        msg = await client.send_message(
+                            chat_id,
+                            format_queue_status(ahead, filename),
+                            reply_to=reply_to,
+                        )
                     ticket.status_id = msg.id
                 except Exception as exc:
                     logging.warning("Could not send queue message (%s)", type(exc).__name__)
@@ -1741,24 +2054,41 @@ def _purge_reuse_offers() -> None:
         _drop_reuse_offer(key)
 
 
-async def _offer_previous_result(client: TelegramClient, message: Any, record: dict, key: str) -> None:
+async def _offer_previous_result(
+    client: TelegramClient,
+    message: Any,
+    record: dict,
+    key: str,
+    requester_id: int | None = None,
+    enqueue_kwargs: dict | None = None,
+    mention_html: str | None = None,
+) -> None:
     _purge_reuse_offers()
     token = secrets.token_hex(4)
+    owner = requester_id if requester_id is not None else message.sender_id
     _reuse_offers[token] = {
-        "user_id": message.sender_id,
+        "user_id": owner,
         "message": message,
         "record": record,
         "file_key": key,
         "expires": time.time() + REUSE_TTL_SEC,
+        "enqueue_kwargs": enqueue_kwargs or {},
+        "group": requester_id is not None,
+        "mention_html": mention_html or "",
+        "reply_to": getattr(message, "id", None),
     }
+    text = "这个视频已经有生成记录，别人生成过的也可以用。\n要直接使用之前的缩略图，还是重新生成？"
+    if mention_html:
+        text = f"{mention_html}\n{text}"
     await client.send_message(
         message.chat_id,
-        "这个视频已经有生成记录，别人生成过的也可以用。\n要合并转发之前的图片和视频，还是重新生成？",
+        text,
         buttons=[[
             Button.inline("使用之前的", f"reuse:y:{token}".encode()),
             Button.inline("重新生成", f"reuse:n:{token}".encode()),
         ]],
         reply_to=message.id,
+        parse_mode="html" if mention_html else None,
     )
 
 
@@ -1789,6 +2119,37 @@ async def _forward_saved_result(client: TelegramClient, chat_id: int, record: di
         return False
 
 
+async def _send_saved_sheet(
+    client: TelegramClient,
+    chat_id: int,
+    record: dict,
+    *,
+    reply_to: int,
+    mention_html: str = "",
+    video: Any = None,
+) -> bool:
+    try:
+        image = await _saved_message(client, record["image_chat_id"], record["image_message_id"])
+    except Exception:
+        logging.warning("saved sheet lookup failed", exc_info=True)
+        return False
+    if image is None:
+        return False
+    caption = mention_html or ""
+    try:
+        await client.send_file(
+            chat_id,
+            image,
+            caption=caption or None,
+            reply_to=int(reply_to),
+            parse_mode="html" if mention_html else None,
+        )
+        return True
+    except Exception:
+        logging.warning("saved sheet reply failed", exc_info=True)
+        return False
+
+
 async def process_message(
     client: TelegramClient,
     media_server: MTProtoRangeServer,
@@ -1799,27 +2160,51 @@ async def process_message(
     access: AccessControl | None = None,
     forward: "ForwardGate | None" = None,
     task_log: TaskLog | None = None,
+    preference_user_id: int | None = None,
+    offer_pack: bool = True,
+    quote_msg_id: int | None = None,
+    quote_top_id: int | None = None,
+    command_msg_id: int | None = None,
+    header_msg_id: int | None = None,
+    mention_user_id: int | None = None,
+    mention_label: str | None = None,
 ) -> None:
     chat_id = message.chat_id
     message_id = message.id
+    reply_id = quote_msg_id or message_id
     video = extract_video(message)
     if not video:
         await client.send_message(chat_id, "请发送视频文件，或把视频作为 document 发送给我。", reply_to=message_id)
         return
 
     filename = video.get("file_name") or "telegram-video.mp4"
-    ticket = await queue.join(client, chat_id, message_id, Path(filename).name)
+    peer = await _input_peer(client, message, chat_id) if quote_msg_id else None
+    ticket = await queue.join(
+        client, chat_id, reply_id, Path(filename).name,
+        quote_top_id=quote_top_id, peer=peer,
+    )
     try:
-        preset = preferences.get(message.sender_id)
-        delivery = preferences.get_delivery(message.sender_id)
-        theme = preferences.get_theme(message.sender_id)
+        pref_id = preference_user_id if preference_user_id is not None else message.sender_id
+        preset = preferences.get(pref_id)
+        delivery = preferences.get_delivery(pref_id)
+        theme = preferences.get_theme(pref_id)
         tmp_dir = Path(tempfile.mkdtemp(prefix="vthumb_bot_"))
         range_key: str | None = None
         progress: ProgressReporter | None = None
         try:
-            progress = await ProgressReporter.create(
-                client, chat_id, message_id, existing_id=ticket.status_id
-            )
+            if quote_msg_id and ticket.status_id is None and peer is not None:
+                opening = await _send_text_quoting(
+                    client,
+                    peer,
+                    "收到，准备按需读取视频分块。大视频不会预先完整下载。",
+                    reply_id,
+                    quote_top_id,
+                )
+                progress = ProgressReporter(client, chat_id, opening.id)
+            else:
+                progress = await ProgressReporter.create(
+                    client, chat_id, reply_id, existing_id=ticket.status_id
+                )
             file_size = video.get("file_size")
             if not isinstance(file_size, int) or file_size <= 0:
                 raise RuntimeError("Telegram did not provide the video file size.")
@@ -1863,15 +2248,34 @@ async def process_message(
                     logging.warning("sheet jpeg convert failed, uploading png", exc_info=True)
             output_size = send_path.stat().st_size
             await progress.show_now("upload", 0, output_size)
-            sent = await client.send_file(
-                chat_id,
-                str(send_path),
-                caption=caption_name,
-                force_document=delivery == DELIVERY_FILE,
-                reply_to=message_id,
-                parse_mode=None,
-                progress_callback=lambda current, total: progress.report("upload", current, total),
-            )
+            if quote_msg_id:
+                mention = _html_mention(mention_user_id, mention_label)
+                sheet_caption = f"{mention}\n{html.escape(caption_name)}" if mention else caption_name
+                sent = await client.send_file(
+                    chat_id,
+                    str(send_path),
+                    caption=sheet_caption,
+                    force_document=delivery == DELIVERY_FILE,
+                    reply_to=int(quote_msg_id),
+                    parse_mode="html",
+                    progress_callback=lambda current, total: progress.report("upload", current, total),
+                )
+                reply_hdr = getattr(sent, "reply_to", None) if not isinstance(sent, list) else None
+                logging.info(
+                    "group sheet reply target=%s attached=%s",
+                    quote_msg_id,
+                    getattr(reply_hdr, "reply_to_msg_id", None) if reply_hdr else None,
+                )
+            else:
+                sent = await client.send_file(
+                    chat_id,
+                    str(send_path),
+                    caption=caption_name,
+                    force_document=delivery == DELIVERY_FILE,
+                    reply_to=message_id,
+                    parse_mode=None,
+                    progress_callback=lambda current, total: progress.report("upload", current, total),
+                )
             await progress.finish("处理完成，缩略图已发送。")
             if isinstance(sent, list):
                 sent = sent[0] if sent else None
@@ -1885,17 +2289,22 @@ async def process_message(
                     image_message_id=sent.id,
                     content_key=content_key(message),
                 )
-            with contextlib.suppress(Exception):
-                await _offer_pack_forward(
-                    client,
-                    message,
-                    sent,
-                    output,
-                    queue=queue,
-                    remux_max_mb=settings.remux_max_mb,
-                )
+            if offer_pack:
+                with contextlib.suppress(Exception):
+                    await _offer_pack_forward(
+                        client,
+                        message,
+                        sent,
+                        output,
+                        queue=queue,
+                        remux_max_mb=settings.remux_max_mb,
+                    )
             if access is not None and forward is not None:
-                await _forward_note_success(client, access, forward, message, output)
+                await _forward_note_success(
+                    client, access, forward, message, output,
+                    requester_id=preference_user_id,
+                    requester_label=mention_label,
+                )
         except Exception as exc:
             if range_key:
                 exc = media_server.failure(range_key) or exc
@@ -1916,6 +2325,8 @@ async def process_message(
                 error_text = "处理失败：" + user_error_message(exc)
                 if progress:
                     await progress.finish(error_text)
+                elif quote_msg_id and peer is not None:
+                    await _send_text_quoting(client, peer, error_text, reply_id, quote_top_id)
                 else:
                     await client.send_message(chat_id, error_text, reply_to=message_id)
             except Exception as reply_exc:
@@ -1968,16 +2379,36 @@ async def poll() -> None:
     _audience.add_many(access.users())
     _audience.add_many(preferences.known_user_ids())
     _audience.add_many(task_log.known_user_ids())
+    groups = GroupAccess(Path(settings.access_file).with_name("groups.json"))
     tasks: set[asyncio.Task[None]] = set()
 
-    def _start_generation(message: Any) -> None:
-        user_id = message.sender_id
+    def _start_generation(
+        message: Any,
+        *,
+        preference_user_id: int | None = None,
+        offer_pack: bool = True,
+        quote_msg_id: int | None = None,
+        quote_top_id: int | None = None,
+        command_msg_id: int | None = None,
+        header_msg_id: int | None = None,
+        mention_user_id: int | None = None,
+        mention_label: str | None = None,
+    ) -> None:
+        user_id = preference_user_id if preference_user_id is not None else message.sender_id
         if user_id is not None and not access.has_grant(user_id):
             task_log.consume(user_id)
         task = asyncio.create_task(
             process_message(
                 mt_client, media_server, settings, preferences, queue, message,
                 access=access, forward=forward, task_log=task_log,
+                preference_user_id=preference_user_id,
+                offer_pack=offer_pack,
+                quote_msg_id=quote_msg_id,
+                quote_top_id=quote_top_id,
+                command_msg_id=command_msg_id,
+                header_msg_id=header_msg_id,
+                mention_user_id=mention_user_id,
+                mention_label=mention_label,
             )
         )
         tasks.add(task)
@@ -1990,7 +2421,10 @@ async def poll() -> None:
         if await handle_command(
             mt_client, settings, access, preferences, event.message,
             queue=queue, forward=forward, task_log=task_log,
+            groups=groups, enqueue=_start_generation,
         ):
+            return
+        if event.is_group:
             return
         if event.sender_id in _announce_wait:
             edited = _announce_edit_text(event.message)
@@ -2055,27 +2489,40 @@ async def poll() -> None:
             await event.answer("这不是你的任务。", alert=True)
             return
         message = offer["message"]
+        requester = offer["user_id"]
         if action == "y":
             _drop_reuse_offer(token)
-            ok = await _forward_saved_result(mt_client, message.chat_id, offer["record"])
-            await event.answer("已转发" if ok else "转发失败")
+            if offer.get("group"):
+                ok = await _send_saved_sheet(
+                    mt_client,
+                    message.chat_id,
+                    offer["record"],
+                    reply_to=offer.get("reply_to") or message.id,
+                    mention_html=offer.get("mention_html") or "",
+                    video=message,
+                )
+                done = "已把之前的缩略图发给你，并引用了原视频。这次不计入生成次数。"
+            else:
+                ok = await _forward_saved_result(mt_client, message.chat_id, offer["record"])
+                done = "已把之前的图片和视频合并成一条发给你。这次不计入生成次数。"
+            await event.answer("已发送" if ok else "发送失败")
             with contextlib.suppress(Exception):
                 await event.edit(
-                    "已把之前的图片和视频合并成一条发给你。这次不计入生成次数。"
-                    if ok
-                    else "之前的记录已失效，无法转发。可以再发一次并选择重新生成。"
+                    done if ok else "之前的记录已失效，无法发送。可以再发一次并选择重新生成。",
+                    buttons=None,
                 )
             return
-        if not access.has_grant(message.sender_id) and not task_log.can_generate(message.sender_id):
+        if not access.has_grant(requester) and not task_log.can_generate(requester):
             await event.answer("今天的次数已用完", alert=True)
             with contextlib.suppress(Exception):
                 await event.edit(quota_message(settings.guest_daily_limit, settings.community_url), buttons=None)
             return
         _drop_reuse_offer(token)
         await event.answer("开始重新生成")
+        note = "好的，重新生成。" if access.has_grant(requester) else "好的，重新生成。这次会计入次数。"
         with contextlib.suppress(Exception):
-            await event.edit("好的，重新生成。", buttons=None)
-        _start_generation(message)
+            await event.edit(note, buttons=None)
+        _start_generation(message, **(offer.get("enqueue_kwargs") or {}))
 
     @mt_client.on(events.CallbackQuery(pattern=b"^ann:"))
     async def on_announce(event: events.CallbackQuery.Event) -> None:

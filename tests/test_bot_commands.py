@@ -16,6 +16,7 @@ from app.bot import (
     short_filename,
     _merge_classify,
     pack_offer_prompt,
+    _quote_ids,
 )
 
 
@@ -175,6 +176,12 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
 
     def test_inline_video_pack_prompt_unchanged(self) -> None:
         self.assertIn("合并成一条消息", pack_offer_prompt(False, 80))
+
+    def test_group_quote_ids_use_reply_header(self) -> None:
+        header = type("H", (), {"reply_to_msg_id": 55, "reply_to_top_id": 9})()
+        command = type("C", (), {"reply_to": header})()
+        self.assertEqual(_quote_ids(command), (55, 9))
+        self.assertEqual(_quote_ids(type("C", (), {"reply_to": None})()), (None, None))
 
 
 if __name__ == "__main__":

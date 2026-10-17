@@ -92,6 +92,8 @@ class MTProtoRangeServer:
         self.cache_bytes = cache_bytes
         self.registrations: dict[str, MediaRegistration] = {}
         self.source_locks: dict[str, asyncio.Lock] = {}
+        self.download_slots = asyncio.Semaphore(3)
+        self.budget_lock = asyncio.Lock()
         self.cache: OrderedDict[tuple[str, int], bytes] = OrderedDict()
         self.cache_size = 0
         self.runner: web.AppRunner | None = None
@@ -214,8 +216,7 @@ class MTProtoRangeServer:
         if cached is not None:
             return cached
 
-        source_lock = self.source_locks.setdefault(key, asyncio.Lock())
-        async with source_lock:
+        async with self.download_slots:
             if registration.failure:
                 raise registration.failure
             cached = self._take_cached(cache_key, registration)
@@ -227,7 +228,8 @@ class MTProtoRangeServer:
 
             offset = chunk_index * self.chunk_size
             expected = min(self.chunk_size, registration.size - offset)
-            self._ensure_budget(registration, expected)
+            async with self.budget_lock:
+                self._ensure_budget(registration, expected)
 
             iterator = self.client.iter_download(
                 registration.media,
@@ -244,7 +246,8 @@ class MTProtoRangeServer:
             if not chunk:
                 raise RuntimeError("Telegram returned an empty media chunk.")
 
-            registration.fetched += len(chunk)
+            async with self.budget_lock:
+                registration.fetched += len(chunk)
             self._store_disk_chunk(registration, chunk_index, chunk)
             self._store_memory_chunk(cache_key, chunk)
             return chunk
