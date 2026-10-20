@@ -35,6 +35,16 @@ class ByteRangeTests(unittest.TestCase):
         with self.assertRaises(InvalidRange):
             parse_byte_range("bytes=1024-", 1024)
 
+    def test_open_ended_range_is_capped(self) -> None:
+        from app.mtproto_range import cap_open_ended
+
+        start, end, partial = parse_byte_range("bytes=0-", 50_000_000)
+        capped_start, capped_end, capped = cap_open_ended("bytes=0-", start, end)
+        self.assertTrue(capped)
+        self.assertEqual(capped_start, 0)
+        self.assertLess(capped_end, end)
+        self.assertTrue(partial)
+
 
 class ChunkCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_media_registration(self) -> None:
