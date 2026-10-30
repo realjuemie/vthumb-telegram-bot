@@ -78,6 +78,7 @@ BOT_COMMANDS = (
     ("setting", "选择每个用户独立的缩略图预设"),
     ("id", "查看自己的 Telegram 用户 ID"),
     ("info", "查看账号、授权状态和今日剩余次数"),
+    ("checkin", "每日签到，获得可储存的使用次数"),
     ("add", "管理员：添加授权用户"),
     ("del", "管理员：删除授权用户"),
     ("users", "管理员：查看授权用户"),
@@ -143,12 +144,27 @@ def command_name(text: str | None) -> str | None:
     return command or None
 
 
+def command_mention(text: str | None) -> str | None:
+    """Return the @username a command is addressed to, if any."""
+    if not text or not text.startswith("/"):
+        return None
+    token = text.split(None, 1)[0]
+    if "@" not in token:
+        return None
+    mention = token.split("@", 1)[1].strip().lower()
+    return mention or None
+
+
 def permission_message(user_id: int | None) -> str:
     return f"你还没有使用权限。\n你的 Telegram ID：{user_id or '未知'}\n请将此 ID 提供给管理员添加。"
 
 
 def quota_message(limit: int, community_url: str) -> str:
-    text = f"今天的 {limit} 次生成已经用完。\n请通过社群群聊联系开发者升级权限。"
+    text = (
+        f"今天的 {limit} 次生成已经用完，储存次数也没有了。\n"
+        "发送 /checkin 每天可再获得 1 到 10 次。\n"
+        "请通过社群群聊联系开发者升级权限。"
+    )
     if community_url:
         text += f"\n{community_url}"
     return text
@@ -270,6 +286,19 @@ async def _send_file_quoting(
 
 def _is_group_message(message: Any) -> bool:
     return bool(getattr(message, "is_group", False))
+
+
+_bot_username_cache: str | None = None
+
+
+async def _bot_username(client: TelegramClient) -> str | None:
+    global _bot_username_cache
+    if _bot_username_cache:
+        return _bot_username_cache
+    me = await client.get_me()
+    username = (getattr(me, "username", None) or "").strip().lower()
+    _bot_username_cache = username or None
+    return _bot_username_cache
 
 
 def _multipart_body(fields: dict[str, str], file_field: str, filename: str, data: bytes, mime: str) -> tuple[str, bytes]:
@@ -557,7 +586,12 @@ def setting_text(preset: ThumbnailPreset, delivery: str, theme: str) -> str:
     )
 
 
-def setting_buttons(current: ThumbnailPreset, delivery: str, theme: str) -> list[list[Button]]:
+def setting_buttons(
+    current: ThumbnailPreset,
+    delivery: str,
+    theme: str,
+    admin_forward: bool | None = None,
+) -> list[list[Button]]:
     buttons = []
     for preset in PRESETS:
         marker = "✓ " if preset == current else ""
@@ -586,12 +620,16 @@ def setting_buttons(current: ThumbnailPreset, delivery: str, theme: str) -> list
             )
         )
     theme_rows = [theme_buttons[i : i + 2] for i in range(0, len(theme_buttons), 2)]
-    return [
+    rows = [
         buttons[:2],
         buttons[2:],
         delivery_buttons,
         *theme_rows,
     ]
+    if admin_forward is not None:
+        label = "任务转发管理员：开" if admin_forward else "任务转发管理员：关"
+        rows.append([Button.inline(label, data=b"fwdgate:toggle")])
+    return rows
 
 
 def setting_from_callback(data: bytes) -> ThumbnailPreset | None:
@@ -639,6 +677,10 @@ async def handle_command(
     command = command_name(message.raw_text)
     if command is None:
         return False
+    if _is_group_message(message):
+        mention = command_mention(message.raw_text)
+        if mention and mention != await _bot_username(client):
+            return True
 
     user_id = message.sender_id
     is_admin = access.is_admin(user_id)
@@ -677,6 +719,7 @@ async def handle_command(
                 text += (
                     f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
                     "使用以前的生成结果不计入次数。"
+                    " /checkin 每天可额外获得 1 到 10 次，存在储存次数里。"
                 )
     elif command == "id":
         text = f"你的 Telegram ID：{user_id or '未知'}"
@@ -696,7 +739,21 @@ async def handle_command(
             is_admin=is_admin,
             used=used,
             limit=limit,
+            stored=task_log.stored_credits(user_id) if task_log is not None and user_id is not None else 0,
         )
+    elif command == "checkin":
+        if task_log is None or user_id is None:
+            text = "签到暂时不可用。"
+        else:
+            result = task_log.check_in(user_id)
+            if result is None:
+                text = f"今天已经签到过了。储存次数：{task_log.stored_credits(user_id)}"
+            else:
+                gained, total = result
+                text = (
+                    f"签到成功，获得 {gained} 次。储存次数：{total}\n"
+                    f"这些次数可以留着，不占每天的 {settings.guest_daily_limit} 次。"
+                )
     elif command == "status":
         if not is_allowed:
             text = permission_message(user_id)
@@ -724,7 +781,12 @@ async def handle_command(
             delivery = preferences.get_delivery(user_id)
             theme = preferences.get_theme(user_id)
             text = setting_text(preset, delivery, theme)
-            buttons = setting_buttons(preset, delivery, theme)
+            buttons = setting_buttons(
+                preset,
+                delivery,
+                theme,
+                admin_forward=forward.enabled if is_admin and forward is not None else None,
+            )
     elif command in {"add", "del", "users"}:
         if not is_admin:
             text = "此命令仅限管理员使用。"
@@ -748,12 +810,6 @@ async def handle_command(
         # /merge [N | cancel | status]
         await _merge_handle(client, settings, access, preferences, message)
         return True
-    elif command == "forward":
-        # Hidden admin toggle. Not listed in BOT_COMMANDS or /help.
-        if not is_admin or forward is None:
-            return True
-        await _forward_handle_command(client, access, forward, message)
-        return True
     elif command == "announce":
         if not is_admin:
             text = "此命令仅限管理员使用。"
@@ -767,6 +823,8 @@ async def handle_command(
         await _handle_thumb_command(client, access, groups, task_log, message, enqueue)
         return True
     else:
+        if _is_group_message(message):
+            return True
         text = "未知命令，请使用 /help 查看可用命令。"
     await client.send_message(message.chat_id, text, reply_to=message.id, buttons=buttons)
     return True
@@ -1175,6 +1233,7 @@ def account_info_text(
     is_admin: bool,
     used: int,
     limit: int,
+    stored: int = 0,
 ) -> str:
     name = ""
     username = None
@@ -1199,7 +1258,8 @@ def account_info_text(
         remaining = max(int(limit) - int(used), 0)
         lines.append("授权用户：否")
         lines.append(f"今日剩余次数：{remaining}/{limit}")
-        lines.append("使用以前的生成记录不计入次数。")
+        lines.append(f"储存次数：{stored}")
+        lines.append("使用以前的生成记录不计入次数。每日签到获得的次数会存在这里。")
     return "\n".join(lines)
 
 
@@ -1228,26 +1288,6 @@ def format_forward_notice(label: str, user_id: int | None, count: int) -> str:
 
 
 _pending_forward: dict[int, dict] = {}
-
-
-async def _forward_handle_command(
-    client: TelegramClient,
-    access: AccessControl,
-    gate: ForwardGate,
-    message: Any,
-) -> None:
-    raw = (message.raw_text or "").split()
-    arg = raw[1].lower() if len(raw) > 1 else ""
-    if arg in {"on", "1", "true", "开"}:
-        await gate.set_enabled(True)
-        text = "管理员转发已开启。其他用户完成任务后会静默汇总给你。"
-    elif arg in {"off", "0", "false", "关"}:
-        await gate.set_enabled(False)
-        text = "管理员转发已关闭。"
-    else:
-        state = "开" if gate.enabled else "关"
-        text = f"转发当前：{state}\n用法：/forward on 或 /forward off"
-    await client.send_message(message.chat_id, text, reply_to=message.id)
 
 
 async def _forward_note_success(
@@ -2523,7 +2563,7 @@ async def poll() -> None:
                 )
             return
         if not access.has_grant(requester) and not task_log.can_generate(requester):
-            await event.answer("今天的次数已用完", alert=True)
+            await event.answer("今天的次数已用完，可先 /checkin", alert=True)
             with contextlib.suppress(Exception):
                 await event.edit(quota_message(settings.guest_daily_limit, settings.community_url), buttons=None)
             return
@@ -2575,7 +2615,7 @@ async def poll() -> None:
     async def on_pack_offer(event: events.CallbackQuery.Event) -> None:
         await _handle_pack_callback(event)
 
-    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme):"))
+    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme|fwdgate):"))
     async def on_setting(event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id
         if not access.is_allowed(user_id):
@@ -2588,6 +2628,19 @@ async def poll() -> None:
         preset = preferences.get(user_id)
         delivery = preferences.get_delivery(user_id)
         theme = preferences.get_theme(user_id)
+        admin_forward = forward.enabled if access.is_admin(user_id) and forward is not None else None
+        if event.data.startswith(b"fwdgate:"):
+            if not access.is_admin(user_id) or forward is None:
+                await event.answer("没有权限。", alert=True)
+                return
+            await forward.set_enabled(not forward.enabled)
+            admin_forward = forward.enabled
+            await event.answer("已打开" if forward.enabled else "已关闭")
+            await event.edit(
+                setting_text(preset, delivery, theme),
+                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward),
+            )
+            return
         if event.data.startswith(b"setting:"):
             selected = setting_from_callback(event.data)
             if selected is None:
@@ -2613,7 +2666,7 @@ async def poll() -> None:
         if changed:
             await event.edit(
                 setting_text(preset, delivery, theme),
-                buttons=setting_buttons(preset, delivery, theme),
+                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward),
             )
 
     try:

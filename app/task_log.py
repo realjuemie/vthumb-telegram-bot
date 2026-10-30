@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -125,15 +126,57 @@ class TaskLog:
         except (TypeError, ValueError):
             return 0
 
+    def stored_credits(self, user_id: int) -> int:
+        entry = self.quota.get(str(user_id)) or {}
+        try:
+            return max(0, int(entry.get("stored") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def checked_in_on(self, user_id: int, now: datetime | None = None) -> bool:
+        entry = self.quota.get(str(user_id)) or {}
+        return entry.get("checkin") == today_key(now)
+
+    def check_in(self, user_id: int, now: datetime | None = None, roll=None) -> tuple[int, int] | None:
+        """Grant 1-10 stored credits once per day. None if already checked in."""
+        if self.checked_in_on(user_id, now):
+            return None
+        gained = int((roll or random.randint)(1, 10))
+        if gained < 1 or gained > 10:
+            raise ValueError("check-in reward must be from 1 to 10")
+        key = str(user_id)
+        day = today_key(now)
+        entry = dict(self.quota.get(key) or {})
+        if entry.get("date") != day:
+            entry["date"] = day
+            entry["count"] = 0
+        stored = max(0, int(entry.get("stored") or 0)) + gained
+        entry["stored"] = stored
+        entry["checkin"] = day
+        self.quota[key] = entry
+        self._save()
+        return gained, stored
+
     def can_generate(self, user_id: int, now: datetime | None = None) -> bool:
-        return self.used_today(user_id, now) < self.daily_limit
+        return self.used_today(user_id, now) < self.daily_limit or self.stored_credits(user_id) > 0
 
     def consume(self, user_id: int, now: datetime | None = None) -> int:
         key = str(user_id)
         day = today_key(now)
-        entry = self.quota.get(key) or {}
+        entry = dict(self.quota.get(key) or {})
         count = int(entry.get("count") or 0) if entry.get("date") == day else 0
-        count += 1
-        self.quota[key] = {"date": day, "count": count}
+        stored = max(0, int(entry.get("stored") or 0))
+        if count < self.daily_limit:
+            count += 1
+        elif stored > 0:
+            stored -= 1
+        else:
+            count += 1
+        entry["date"] = day
+        entry["count"] = count
+        entry["stored"] = stored
+        if "checkin" not in entry and (self.quota.get(key) or {}).get("checkin"):
+            entry["checkin"] = self.quota[key].get("checkin")
+        self.quota[key] = entry
         self._save()
         return count

@@ -6,6 +6,7 @@ from app.bot import (
     JobQueue,
     account_info_text,
     command_name,
+    command_mention,
     command_user_id,
     delivery_from_callback,
     format_forward_notice,
@@ -34,6 +35,8 @@ class BotCommandTests(unittest.TestCase):
 
     def test_extracts_addressed_command(self) -> None:
         self.assertEqual(command_name("/help@killfatsbot extra"), "help")
+        self.assertEqual(command_mention("/help@killfatsbot extra"), "killfatsbot")
+        self.assertIsNone(command_mention("/help extra"))
 
     def test_menu_commands_are_unique_and_lowercase(self) -> None:
         names = [name for name, _ in BOT_COMMANDS]
