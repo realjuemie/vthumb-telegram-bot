@@ -5,6 +5,17 @@ import json
 from pathlib import Path
 
 
+def private_sender_id(is_private: bool, sender_id: int | None) -> int | None:
+    """Only private chats belong in the announcement list."""
+    if not is_private or sender_id is None:
+        return None
+    try:
+        value = int(sender_id)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def announce_body(raw: str | None) -> str:
     text = raw or ""
     parts = text.split(None, 1)
@@ -69,6 +80,26 @@ class Audience:
                 self.user_ids.add(value)
         if len(self.user_ids) != before:
             self._save()
+
+    def discard(self, user_id: int) -> None:
+        if int(user_id) not in self.user_ids:
+            return
+        self.user_ids.discard(int(user_id))
+        self._save()
+
+    def replace(self, user_ids) -> None:
+        found: set[int] = set()
+        for user_id in user_ids or []:
+            try:
+                value = int(user_id)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                found.add(value)
+        if found == self.user_ids:
+            return
+        self.user_ids = found
+        self._save()
 
     def ids(self) -> list[int]:
         return sorted(self.user_ids)

@@ -17,7 +17,7 @@ from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions import SQLiteSession
 
 from .access_control import AccessControl, GroupAccess
-from .announce import Audience, announce_body, collect_recipients
+from .announce import Audience, announce_body, private_sender_id
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
 from .settings import Settings
@@ -546,14 +546,41 @@ def _announce_edit_text(message: Any) -> str | None:
     return text
 
 
-async def _publish_announce(client: TelegramClient, text: str, recipients: list[int]) -> tuple[int, int]:
+async def refresh_private_audience(client: TelegramClient, audience: Audience) -> int:
+    """Replace the announcement list with users who already have a private chat."""
+    found: set[int] = set()
+    async for dialog in client.iter_dialogs():
+        if not dialog.is_user:
+            continue
+        entity = dialog.entity
+        if entity is None or getattr(entity, "bot", False):
+            continue
+        user_id = int(getattr(entity, "id", 0) or 0)
+        if user_id > 0:
+            found.add(user_id)
+    if not found:
+        logging.warning("private audience refresh found no users; keeping the saved list")
+        return len(audience.ids())
+    audience.replace(found)
+    logging.info("announcement audience limited to %s private chats", len(found))
+    return len(found)
+
+
+async def _publish_announce(
+    client: TelegramClient,
+    text: str,
+    recipients: list[int],
+    audience: Audience | None = None,
+) -> tuple[int, int]:
     sent = 0
     failed = 0
     for user_id in recipients:
         try:
             await client.send_message(user_id, text, parse_mode="md", link_preview=False)
             sent += 1
-        except Exception:
+        except Exception as exc:
+            if audience is not None and type(exc).__name__ == "PeerIdInvalidError":
+                audience.discard(user_id)
             logging.warning("announce delivery failed for %s", user_id, exc_info=True)
             failed += 1
         await asyncio.sleep(0.05)
@@ -2425,10 +2452,6 @@ async def poll() -> None:
     )
     global _audience
     _audience = Audience(Path(settings.access_file).with_name("audience.json"))
-    _audience.add_many(access.admin_ids)
-    _audience.add_many(access.users())
-    _audience.add_many(preferences.known_user_ids())
-    _audience.add_many(task_log.known_user_ids())
     groups = GroupAccess(Path(settings.access_file).with_name("groups.json"))
     tasks: set[asyncio.Task[None]] = set()
 
@@ -2466,8 +2489,9 @@ async def poll() -> None:
 
     @mt_client.on(events.NewMessage(incoming=True))
     async def on_message(event: events.NewMessage.Event) -> None:
-        if event.sender_id and _audience is not None:
-            _audience.note(event.sender_id)
+        sender = private_sender_id(bool(event.is_private), event.sender_id)
+        if sender and _audience is not None:
+            _audience.note(sender)
         if await handle_command(
             mt_client, settings, access, preferences, event.message,
             queue=queue, forward=forward, task_log=task_log,
@@ -2596,18 +2620,15 @@ async def poll() -> None:
         text = draft["text"]
         publisher = draft["admin_id"]
         _announce_drafts.pop(token, None)
-        recipients = collect_recipients(
-            _audience.ids() if _audience is not None else [],
-            access.users(),
-            access.admin_ids,
-            preferences.known_user_ids(),
-            task_log.known_user_ids(),
-        )
-        recipients = [user_id for user_id in recipients if user_id != publisher]
+        recipients = [
+            user_id
+            for user_id in (_audience.ids() if _audience is not None else [])
+            if user_id != publisher
+        ]
         await event.answer("开始发布")
         with contextlib.suppress(Exception):
-            await event.edit("正在发布公告…", buttons=None)
-        sent, failed = await _publish_announce(mt_client, text, recipients)
+            await event.edit(f"正在发布公告… 共 {len(recipients)} 人", buttons=None)
+        sent, failed = await _publish_announce(mt_client, text, recipients, _audience)
         with contextlib.suppress(Exception):
             await event.edit(f"公告已发布。成功 {sent} 人，失败 {failed} 人。")
 
@@ -2671,6 +2692,7 @@ async def poll() -> None:
 
     try:
         await mt_client.start(bot_token=settings.bot_token)
+        await refresh_private_audience(mt_client, _audience)
         await set_bot_commands(mt_client)
         await media_server.start()
         logging.info(
