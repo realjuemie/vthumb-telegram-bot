@@ -546,26 +546,6 @@ def _announce_edit_text(message: Any) -> str | None:
     return text
 
 
-async def refresh_private_audience(client: TelegramClient, audience: Audience) -> int:
-    """Replace the announcement list with users who already have a private chat."""
-    found: set[int] = set()
-    async for dialog in client.iter_dialogs():
-        if not dialog.is_user:
-            continue
-        entity = dialog.entity
-        if entity is None or getattr(entity, "bot", False):
-            continue
-        user_id = int(getattr(entity, "id", 0) or 0)
-        if user_id > 0:
-            found.add(user_id)
-    if not found:
-        logging.warning("private audience refresh found no users; keeping the saved list")
-        return len(audience.ids())
-    audience.replace(found)
-    logging.info("announcement audience limited to %s private chats", len(found))
-    return len(found)
-
-
 async def _publish_announce(
     client: TelegramClient,
     text: str,
@@ -2692,7 +2672,6 @@ async def poll() -> None:
 
     try:
         await mt_client.start(bot_token=settings.bot_token)
-        await refresh_private_audience(mt_client, _audience)
         await set_bot_commands(mt_client)
         await media_server.start()
         logging.info(
