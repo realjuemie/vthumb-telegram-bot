@@ -12,16 +12,16 @@ Telegram 视频缩略图机器人：按需读取分块，生成 PotPlayer 风格
 <th align="center">白底黑字</th>
 </tr>
 <tr>
-<td><img src="docs/examples/theme-potplayer.jpg" alt="PotPlayer 风格"></td>
-<td><img src="docs/examples/theme-white-bg.jpg" alt="白底黑字"></td>
+<td valign="top"><img src="docs/examples/theme-potplayer.jpg" alt="PotPlayer 风格" width="400"></td>
+<td valign="top"><img src="docs/examples/theme-white-bg.jpg" alt="白底黑字" width="400"></td>
 </tr>
 <tr>
 <th align="center">纯图无信息</th>
 <th align="center">黑底白字</th>
 </tr>
 <tr>
-<td><img src="docs/examples/theme-pure-image.jpg" alt="纯图无信息"></td>
-<td><img src="docs/examples/theme-black-bg.jpg" alt="黑底白字"></td>
+<td valign="top"><img src="docs/examples/theme-pure-image.jpg" alt="纯图无信息" width="400"></td>
+<td valign="top"><img src="docs/examples/theme-black-bg.jpg" alt="黑底白字" width="400"></td>
 </tr>
 </table>
 
