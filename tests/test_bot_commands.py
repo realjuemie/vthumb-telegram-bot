@@ -8,6 +8,9 @@ from app.bot import (
     command_name,
     command_mention,
     command_user_id,
+    menu_action,
+    menu_rows,
+    private_menu_action,
     delivery_from_callback,
     format_forward_notice,
     format_progress,
@@ -43,6 +46,26 @@ class BotCommandTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(name.isascii() and name.islower() for name in names))
         self.assertNotIn("forward", names)
+
+    def test_reply_menu_maps_labels_and_hides_admin_rows(self) -> None:
+        self.assertEqual(menu_action("  使用说明  "), "/help")
+        self.assertEqual(menu_action("取消合并"), "/merge cancel")
+        self.assertEqual(menu_action("发布公告"), "/announce")
+        self.assertIsNone(menu_action("/help"))
+        self.assertIsNone(menu_action("转发"))
+        guest = [label for row in menu_rows(False) for label in row]
+        admin = [label for row in menu_rows(True) for label in row]
+        self.assertIn("我的信息", guest)
+        self.assertNotIn("授权名单", guest)
+        self.assertNotIn("发布公告", guest)
+        self.assertIn("授权名单", admin)
+        self.assertNotIn("转发", "".join(admin))
+        video = type("M", (), {"is_private": True, "media": object(), "document": None, "raw_text": "使用说明"})()
+        self.assertIsNone(private_menu_action(video))
+        group = type("M", (), {"is_private": False, "is_group": True, "media": None, "document": None, "raw_text": "使用说明"})()
+        self.assertIsNone(private_menu_action(group))
+        tap = type("M", (), {"is_private": True, "media": None, "document": None, "raw_text": "每日签到"})()
+        self.assertEqual(private_menu_action(tap), "/checkin")
 
     def test_extracts_add_user_id(self) -> None:
         self.assertEqual(command_user_id("/add 123456789"), 123456789)

@@ -88,6 +88,26 @@ BOT_COMMANDS = (
     ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
 )
 
+# Bottom reply keyboard in private chats. Labels are exact message text.
+# Do not put the admin-forward toggle here — that stays on /setting only.
+# /group and /thumb stay slash-only: they only work as a reply inside a group.
+USER_MENU_ROWS = (
+    ("使用说明", "我的设置", "运行状态"),
+    ("我的信息", "每日签到", "合并消息", "取消合并"),
+)
+ADMIN_MENU_ROW = ("授权名单", "发布公告")
+MENU_ACTIONS = {
+    "使用说明": "/help",
+    "我的设置": "/setting",
+    "运行状态": "/status",
+    "我的信息": "/info",
+    "每日签到": "/checkin",
+    "合并消息": "/merge",
+    "取消合并": "/merge cancel",
+    "授权名单": "/users",
+    "发布公告": "/announce",
+}
+
 # ── /merge feature constants ─────────────────────────────────────────
 MERGE_DEFAULT_COUNT = 2          # bare /merge picks this many
 MERGE_MAX_COUNT     = 20         # Telegram media_group caps at 10 per batch
@@ -212,7 +232,12 @@ async def _begin_announce(client: TelegramClient, message: Any) -> None:
     if not body:
         if message.sender_id:
             _announce_wait.add(message.sender_id)
-        await client.send_message(message.chat_id, ANNOUNCE_HINT, reply_to=message.id)
+        await client.send_message(
+            message.chat_id,
+            ANNOUNCE_HINT,
+            reply_to=message.id,
+            buttons=_reply_menu(message, True),
+        )
         return
     await _show_announce_preview(client, message.sender_id, message.chat_id, body, message.id)
 
@@ -286,6 +311,61 @@ async def _send_file_quoting(
 
 def _is_group_message(message: Any) -> bool:
     return bool(getattr(message, "is_group", False))
+
+
+def _is_private_message(message: Any) -> bool:
+    return getattr(message, "is_private", None) is True
+
+
+def menu_rows(is_admin: bool) -> tuple[tuple[str, ...], ...]:
+    if is_admin:
+        return USER_MENU_ROWS + (ADMIN_MENU_ROW,)
+    return USER_MENU_ROWS
+
+
+def menu_action(text: str | None) -> str | None:
+    if not text:
+        return None
+    return MENU_ACTIONS.get(text.strip())
+
+
+def private_menu_action(message: Any) -> str | None:
+    """Button taps are plain text. Ignore them on media and outside private chats."""
+    if not _is_private_message(message):
+        return None
+    if getattr(message, "media", None) or extract_video(message):
+        return None
+    return menu_action(getattr(message, "raw_text", None))
+
+
+def main_menu(is_admin: bool):
+    rows = []
+    for row_index, row in enumerate(menu_rows(is_admin)):
+        buttons = []
+        for col_index, label in enumerate(row):
+            if row_index == 0 and col_index == 0:
+                buttons.append(Button.text(label, resize=True))
+            else:
+                buttons.append(Button.text(label))
+        rows.append(buttons)
+    return rows
+
+
+def _reply_menu(message: Any, is_admin: bool, buttons=None):
+    if buttons is not None or not _is_private_message(message):
+        return buttons
+    return main_menu(is_admin)
+
+
+class _AsCommand:
+    """Make a button tap look like the slash command it stands for."""
+
+    def __init__(self, message: Any, raw_text: str) -> None:
+        self._message = message
+        self.raw_text = raw_text
+
+    def __getattr__(self, name: str):
+        return getattr(self._message, name)
 
 
 _bot_username_cache: str | None = None
@@ -697,8 +777,9 @@ async def handle_command(
     if command == "start":
         if is_allowed:
             text = (
-                "发送视频或以文件形式发送视频，我会按需读取分块并生成缩略图。\n"
-                "不会预先完整下载大视频。\n\n使用 /help 查看详细说明。"
+                "直接发送视频，或把视频作为文件发送，我会生成缩略图。\n"
+                "不会预先完整下载大视频。\n\n"
+                "下方按钮和 /help 里的命令是一样的。"
             )
         else:
             text = permission_message(user_id)
@@ -720,8 +801,12 @@ async def handle_command(
                 "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。\n"
                 "9. 已授权的群里，回复视频并发送 /thumb。任务和私聊共用队列。"
             )
+            if not _is_group_message(message):
+                text += "\n\n也可以直接点下方按钮。"
             if is_admin:
                 text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/announce 公告内容\n/group 在群里授权该群\n/thumb 回复视频生成缩略图"
+                if not _is_group_message(message):
+                    text += "\n授权名单、发布公告也可以点下方按钮。/add、/del 需要带用户 ID。"
             if not access.has_grant(user_id):
                 text += (
                     f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
@@ -833,7 +918,12 @@ async def handle_command(
         if _is_group_message(message):
             return True
         text = "未知命令，请使用 /help 查看可用命令。"
-    await client.send_message(message.chat_id, text, reply_to=message.id, buttons=buttons)
+    await client.send_message(
+        message.chat_id,
+        text,
+        reply_to=message.id,
+        buttons=_reply_menu(message, is_admin, buttons),
+    )
     return True
 
 
@@ -2002,6 +2092,7 @@ class ProgressReporter:
         chat_id: int,
         reply_to: int,
         existing_id: int | None = None,
+        buttons=None,
     ) -> "ProgressReporter":
         start_text = "收到，准备按需读取视频分块。大视频不会预先完整下载。"
         if existing_id is not None:
@@ -2012,6 +2103,7 @@ class ProgressReporter:
             chat_id,
             start_text,
             reply_to=reply_to,
+            buttons=buttons,
         )
         return cls(client, chat_id, message.id)
 
@@ -2226,9 +2318,15 @@ async def process_message(
     chat_id = message.chat_id
     message_id = message.id
     reply_id = quote_msg_id or message_id
+    menu = main_menu(bool(access and access.is_admin(message.sender_id))) if _is_private_message(message) else None
     video = extract_video(message)
     if not video:
-        await client.send_message(chat_id, "请发送视频文件，或把视频作为 document 发送给我。", reply_to=message_id)
+        await client.send_message(
+            chat_id,
+            "请发送视频文件，或把视频作为 document 发送给我。",
+            reply_to=message_id,
+            buttons=menu,
+        )
         return
 
     filename = video.get("file_name") or "telegram-video.mp4"
@@ -2257,7 +2355,7 @@ async def process_message(
                 progress = ProgressReporter(client, chat_id, opening.id)
             else:
                 progress = await ProgressReporter.create(
-                    client, chat_id, reply_id, existing_id=ticket.status_id
+                    client, chat_id, reply_id, existing_id=ticket.status_id, buttons=menu,
                 )
             file_size = video.get("file_size")
             if not isinstance(file_size, int) or file_size <= 0:
@@ -2472,6 +2570,16 @@ async def poll() -> None:
         sender = private_sender_id(bool(event.is_private), event.sender_id)
         if sender and _audience is not None:
             _audience.note(sender)
+        action = private_menu_action(event.message)
+        if action:
+            if not action.startswith("/announce"):
+                _announce_wait.discard(event.sender_id)
+            if await handle_command(
+                mt_client, settings, access, preferences, _AsCommand(event.message, action),
+                queue=queue, forward=forward, task_log=task_log,
+                groups=groups, enqueue=_start_generation,
+            ):
+                return
         if await handle_command(
             mt_client, settings, access, preferences, event.message,
             queue=queue, forward=forward, task_log=task_log,
@@ -2501,6 +2609,7 @@ async def poll() -> None:
                     event.chat_id,
                     permission_message(event.sender_id),
                     reply_to=event.message.id,
+                    buttons=main_menu(False) if event.is_private else None,
                 )
                 return
             task = asyncio.create_task(
@@ -2522,6 +2631,7 @@ async def poll() -> None:
                 event.chat_id,
                 quota_message(settings.guest_daily_limit, settings.community_url),
                 reply_to=event.message.id,
+                buttons=main_menu(access.is_admin(event.sender_id)) if event.is_private else None,
             )
             return
         _start_generation(event.message)
