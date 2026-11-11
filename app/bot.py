@@ -82,6 +82,8 @@ BOT_COMMANDS = (
     ("add", "管理员：添加授权用户"),
     ("del", "管理员：删除授权用户"),
     ("users", "管理员：查看授权用户"),
+    ("guest", "管理员：开关非授权用户使用"),
+    ("bonus", "管理员：给非授权用户增加储存次数"),
     ("announce", "管理员：预览并发布 Markdown 公告"),
     ("group", "管理员：在群里授权该群使用缩略图"),
     ("thumb", "回复一条视频，生成缩略图"),
@@ -95,7 +97,10 @@ USER_MENU_ROWS = (
     ("使用说明", "我的设置", "运行状态"),
     ("我的信息", "每日签到", "合并消息", "取消合并"),
 )
-ADMIN_MENU_ROW = ("授权名单", "发布公告")
+ADMIN_MENU_ROWS = (
+    ("授权名单", "发布公告"),
+    ("游客开关", "加次数"),
+)
 MENU_ACTIONS = {
     "使用说明": "/help",
     "我的设置": "/setting",
@@ -106,6 +111,8 @@ MENU_ACTIONS = {
     "取消合并": "/merge cancel",
     "授权名单": "/users",
     "发布公告": "/announce",
+    "游客开关": "/guest toggle",
+    "加次数": "/bonus",
 }
 
 # ── /merge feature constants ─────────────────────────────────────────
@@ -192,7 +199,10 @@ def quota_message(limit: int, community_url: str) -> str:
 
 _audience: Audience | None = None
 _announce_wait: set[int] = set()
+_bonus_wait: set[int] = set()
 _announce_drafts: dict[str, dict] = {}
+BONUS_MAX = 100_000
+GUEST_CLOSED_TEXT = "非授权用户暂时不能使用。签到和生成都先停一下。"
 ANNOUNCE_HINT = (
     "请发送公告内容。支持 Markdown：\n"
     "**粗体**、__斜体__、`代码`、[文字](链接)"
@@ -319,7 +329,7 @@ def _is_private_message(message: Any) -> bool:
 
 def menu_rows(is_admin: bool) -> tuple[tuple[str, ...], ...]:
     if is_admin:
-        return USER_MENU_ROWS + (ADMIN_MENU_ROW,)
+        return USER_MENU_ROWS + ADMIN_MENU_ROWS
     return USER_MENU_ROWS
 
 
@@ -760,6 +770,7 @@ async def handle_command(
     task_log: "TaskLog | None" = None,
     groups: "GroupAccess | None" = None,
     enqueue=None,
+    guest_gate: "GuestGate | None" = None,
 ) -> bool:
     command = command_name(message.raw_text)
     if command is None:
@@ -773,6 +784,8 @@ async def handle_command(
     is_admin = access.is_admin(user_id)
     is_allowed = access.is_allowed(user_id)
     buttons = None
+    if user_id is not None and command != "bonus":
+        _bonus_wait.discard(user_id)
 
     if command == "start":
         if is_allowed:
@@ -804,15 +817,17 @@ async def handle_command(
             if not _is_group_message(message):
                 text += "\n\n也可以直接点下方按钮。"
             if is_admin:
-                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/announce 公告内容\n/group 在群里授权该群\n/thumb 回复视频生成缩略图"
+                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/guest on|off\n/bonus 次数\n/announce 公告内容\n/group 在群里授权该群\n/thumb 回复视频生成缩略图"
                 if not _is_group_message(message):
-                    text += "\n授权名单、发布公告也可以点下方按钮。/add、/del 需要带用户 ID。"
+                    text += "\n授权名单、发布公告、游客开关、加次数也可以点下方按钮。/add、/del 需要带用户 ID。/bonus 后面跟次数，例如 /bonus 20。"
             if not access.has_grant(user_id):
                 text += (
                     f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
                     "使用以前的生成结果不计入次数。"
                     " /checkin 每天可额外获得 1 到 10 次，存在储存次数里。"
                 )
+                if guests_closed(access, guest_gate, user_id):
+                    text += "\n\n" + GUEST_CLOSED_TEXT
     elif command == "id":
         text = f"你的 Telegram ID：{user_id or '未知'}"
     elif command == "info":
@@ -832,9 +847,12 @@ async def handle_command(
             used=used,
             limit=limit,
             stored=task_log.stored_credits(user_id) if task_log is not None and user_id is not None else 0,
+            guest_open=not guests_closed(access, guest_gate, user_id),
         )
     elif command == "checkin":
-        if task_log is None or user_id is None:
+        if guests_closed(access, guest_gate, user_id):
+            text = GUEST_CLOSED_TEXT
+        elif task_log is None or user_id is None:
             text = "签到暂时不可用。"
         else:
             result = task_log.check_in(user_id)
@@ -898,10 +916,48 @@ async def handle_command(
             else:
                 removed = await access.remove(target_id)
                 text = f"已删除用户：{target_id}" if removed else f"用户不在授权名单中：{target_id}"
+    elif command == "guest":
+        if not is_admin or guest_gate is None:
+            text = "此命令仅限管理员使用。"
+        else:
+            arg = ""
+            parts = (message.raw_text or "").split()
+            if len(parts) > 1:
+                arg = parts[1].lower()
+            if arg in {"off", "0", "false", "关"}:
+                await guest_gate.set_enabled(False)
+            elif arg in {"on", "1", "true", "开"}:
+                await guest_gate.set_enabled(True)
+            elif arg in {"toggle", "切换"}:
+                await guest_gate.set_enabled(not guest_gate.enabled)
+            known = len(ungranted_user_ids(access, task_log, preferences))
+            text = guest_switch_text(guest_gate.enabled, known)
+    elif command == "bonus":
+        if not is_admin or task_log is None:
+            text = "此命令仅限管理员使用。"
+        else:
+            amount = bonus_amount(message.raw_text)
+            if amount is None and (message.raw_text or "").strip() in {"/bonus", "加次数"}:
+                if user_id is not None:
+                    _bonus_wait.add(user_id)
+                text = f"请发送要增加的次数，1 到 {BONUS_MAX}。只加给已经出现过的非授权用户。"
+            elif amount is None:
+                text = f"格式错误，请使用 /bonus 次数，例如 /bonus 20。范围 1 到 {BONUS_MAX}。"
+            else:
+                _bonus_wait.discard(user_id)
+                targets = ungranted_user_ids(access, task_log, preferences)
+                count = task_log.add_stored_many(targets, amount)
+                text = (
+                    f"已给 {count} 个非授权用户各增加 {amount} 次储存次数。\n"
+                    "这些次数不占每天的 10 次，每天的额度用完后才会扣。\n"
+                    "只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。"
+                )
     elif command == "merge":
-        # /merge [N | cancel | status]
-        await _merge_handle(client, settings, access, preferences, message)
-        return True
+        if guests_closed(access, guest_gate, user_id):
+            text = GUEST_CLOSED_TEXT
+        else:
+            await _merge_handle(client, settings, access, preferences, message)
+            return True
     elif command == "announce":
         if not is_admin:
             text = "此命令仅限管理员使用。"
@@ -1322,6 +1378,85 @@ class ForwardGate:
             return changed
 
 
+class GuestGate:
+    """Whether non-granted users may generate and check in. Default on."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.enabled = self._load()
+        self.lock = asyncio.Lock()
+
+    def _load(self) -> bool:
+        if not self.path.exists():
+            return True
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return bool(payload.get("enabled", True))
+        except (OSError, ValueError, TypeError):
+            return True
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"enabled": self.enabled}) + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+
+    async def set_enabled(self, enabled: bool) -> bool:
+        async with self.lock:
+            changed = self.enabled != enabled
+            self.enabled = enabled
+            self._save()
+            return changed
+
+
+def guests_closed(access: AccessControl, guest_gate: "GuestGate | None", user_id: int | None) -> bool:
+    if guest_gate is None or guest_gate.enabled:
+        return False
+    return not access.has_grant(user_id)
+
+
+def bonus_amount(text: str | None) -> int | None:
+    parts = (text or "").split()
+    if len(parts) < 2:
+        return None
+    return _parse_bonus(parts[1])
+
+
+def plain_bonus_amount(text: str | None) -> int | None:
+    return _parse_bonus((text or "").strip())
+
+
+def _parse_bonus(raw: str) -> int | None:
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    if value < 1 or value > BONUS_MAX:
+        return None
+    return value
+
+
+def ungranted_user_ids(access: AccessControl, task_log: "TaskLog | None", preferences: UserPreferences | None) -> list[int]:
+    found: set[int] = set()
+    if _audience is not None:
+        found.update(int(item) for item in _audience.ids())
+    if task_log is not None:
+        found.update(task_log.known_user_ids())
+    if preferences is not None:
+        found.update(int(item) for item in getattr(preferences, "values", {}))
+        found.update(int(item) for item in getattr(preferences, "delivery_modes", {}))
+        found.update(int(item) for item in getattr(preferences, "theme_modes", {}))
+    return sorted(user_id for user_id in found if user_id > 0 and not access.has_grant(user_id))
+
+
+def guest_switch_text(enabled: bool, known: int) -> str:
+    state = "开放" if enabled else "已关闭"
+    return (
+        f"非授权用户使用：{state}\n"
+        f"已记录的非授权用户：{known} 人\n"
+        "授权用户和管理员不受影响。"
+    )
+
+
 def account_info_text(
     sender: Any,
     user_id: int | None,
@@ -1331,6 +1466,7 @@ def account_info_text(
     used: int,
     limit: int,
     stored: int = 0,
+    guest_open: bool = True,
 ) -> str:
     name = ""
     username = None
@@ -1357,6 +1493,8 @@ def account_info_text(
         lines.append(f"今日剩余次数：{remaining}/{limit}")
         lines.append(f"储存次数：{stored}")
         lines.append("使用以前的生成记录不计入次数。每日签到获得的次数会存在这里。")
+        if not guest_open:
+            lines.append("使用状态：已关闭")
     return "\n".join(lines)
 
 
@@ -2524,6 +2662,7 @@ async def poll() -> None:
     )
     queue = JobQueue(settings.max_concurrent_jobs)
     forward = ForwardGate(Path(settings.access_file).with_name("forward.json"))
+    guest_gate = GuestGate(Path(settings.access_file).with_name("guest.json"))
     task_log = TaskLog(
         Path(settings.access_file).with_name("task_log.json"),
         daily_limit=settings.guest_daily_limit,
@@ -2572,22 +2711,50 @@ async def poll() -> None:
             _audience.note(sender)
         action = private_menu_action(event.message)
         if action:
+            _bonus_wait.discard(event.sender_id)
             if not action.startswith("/announce"):
                 _announce_wait.discard(event.sender_id)
             if await handle_command(
                 mt_client, settings, access, preferences, _AsCommand(event.message, action),
                 queue=queue, forward=forward, task_log=task_log,
-                groups=groups, enqueue=_start_generation,
+                groups=groups, enqueue=_start_generation, guest_gate=guest_gate,
             ):
                 return
         if await handle_command(
             mt_client, settings, access, preferences, event.message,
             queue=queue, forward=forward, task_log=task_log,
-            groups=groups, enqueue=_start_generation,
+            groups=groups, enqueue=_start_generation, guest_gate=guest_gate,
         ):
             return
         if event.is_group:
             return
+        if event.is_private and event.sender_id in _bonus_wait and access.is_admin(event.sender_id):
+            if getattr(event.message, "media", None) or extract_video(event.message):
+                _bonus_wait.discard(event.sender_id)
+            else:
+                amount = plain_bonus_amount(event.raw_text)
+                if amount is None:
+                    await mt_client.send_message(
+                        event.chat_id,
+                        f"请发送 1 到 {BONUS_MAX} 的整数，或点其他按钮取消。",
+                        reply_to=event.message.id,
+                        buttons=main_menu(True),
+                    )
+                    return
+                _bonus_wait.discard(event.sender_id)
+                targets = ungranted_user_ids(access, task_log, preferences)
+                count = task_log.add_stored_many(targets, amount)
+                await mt_client.send_message(
+                    event.chat_id,
+                    (
+                        f"已给 {count} 个非授权用户各增加 {amount} 次储存次数。\n"
+                        "这些次数不占每天的 10 次，每天的额度用完后才会扣。\n"
+                        "只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。"
+                    ),
+                    reply_to=event.message.id,
+                    buttons=main_menu(True),
+                )
+                return
         if event.sender_id in _announce_wait:
             edited = _announce_edit_text(event.message)
             if edited:
@@ -2622,6 +2789,14 @@ async def poll() -> None:
             task.add_done_callback(tasks.discard)
             return
         key = file_key(event.message)
+        if guests_closed(access, guest_gate, event.sender_id):
+            await mt_client.send_message(
+                event.chat_id,
+                GUEST_CLOSED_TEXT,
+                reply_to=event.message.id,
+                buttons=main_menu(False) if event.is_private else None,
+            )
+            return
         record = task_log.lookup(key, content_key(event.message))
         if record:
             await _offer_previous_result(mt_client, event.message, record, key or "")
@@ -2651,6 +2826,9 @@ async def poll() -> None:
             return
         if event.sender_id != offer["user_id"]:
             await event.answer("这不是你的任务。", alert=True)
+            return
+        if guests_closed(access, guest_gate, event.sender_id):
+            await event.answer("非授权用户暂时不能使用", alert=True)
             return
         message = offer["message"]
         requester = offer["user_id"]

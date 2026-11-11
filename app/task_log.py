@@ -180,3 +180,19 @@ class TaskLog:
         self.quota[key] = entry
         self._save()
         return count
+
+    def add_stored_many(self, user_ids, amount: int) -> int:
+        """Add persistent credits. Does not touch today's daily count."""
+        if amount < 1:
+            raise ValueError("amount must be positive")
+        count = 0
+        for user_id in user_ids:
+            key = str(int(user_id))
+            entry = dict(self.quota.get(key) or {})
+            stored = max(0, int(entry.get("stored") or 0)) + int(amount)
+            entry["stored"] = stored
+            self.quota[key] = entry
+            count += 1
+        if count:
+            self._save()
+        return count

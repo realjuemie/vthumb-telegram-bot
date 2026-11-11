@@ -58,7 +58,11 @@ class BotCommandTests(unittest.TestCase):
         self.assertIn("我的信息", guest)
         self.assertNotIn("授权名单", guest)
         self.assertNotIn("发布公告", guest)
+        self.assertNotIn("游客开关", guest)
+        self.assertNotIn("加次数", guest)
         self.assertIn("授权名单", admin)
+        self.assertIn("游客开关", admin)
+        self.assertIn("加次数", admin)
         self.assertNotIn("转发", "".join(admin))
         video = type("M", (), {"is_private": True, "media": object(), "document": None, "raw_text": "使用说明"})()
         self.assertIsNone(private_menu_action(video))
@@ -66,6 +70,33 @@ class BotCommandTests(unittest.TestCase):
         self.assertIsNone(private_menu_action(group))
         tap = type("M", (), {"is_private": True, "media": None, "document": None, "raw_text": "每日签到"})()
         self.assertEqual(private_menu_action(tap), "/checkin")
+
+    def test_guest_bonus_targets_skip_granted_users(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from app.access_control import AccessControl
+        from app.bot import GuestGate, bonus_amount, plain_bonus_amount, ungranted_user_ids
+        from app.task_log import TaskLog
+
+        self.assertEqual(bonus_amount("/bonus 20"), 20)
+        self.assertIsNone(bonus_amount("/bonus 0"))
+        self.assertIsNone(bonus_amount("/bonus"))
+        self.assertEqual(plain_bonus_amount("15"), 15)
+        self.assertIsNone(plain_bonus_amount("十五"))
+        with tempfile.TemporaryDirectory() as directory:
+            access = AccessControl(Path(directory) / "access.json", frozenset({1}), open_access=True)
+            access.user_ids.add(2)
+            log = TaskLog(Path(directory) / "task_log.json")
+            log.quota["2"] = {"stored": 1}
+            log.quota["9"] = {"stored": 0}
+            prefs = type("P", (), {"values": {9: object(), 1: object()}, "delivery_modes": {}, "theme_modes": {}})()
+            self.assertEqual(ungranted_user_ids(access, log, prefs), [9])
+            gate = GuestGate(Path(directory) / "guest.json")
+            self.assertTrue(gate.enabled)
+            gate.enabled = False
+            gate._save()
+            self.assertFalse(GuestGate(Path(directory) / "guest.json").enabled)
 
     def test_extracts_add_user_id(self) -> None:
         self.assertEqual(command_user_id("/add 123456789"), 123456789)
