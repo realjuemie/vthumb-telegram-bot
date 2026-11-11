@@ -108,6 +108,8 @@ class BotCommandTests(unittest.TestCase):
         text = format_progress("frames", 4, 16)
         self.assertIn("4/16", text)
         self.assertIn("25%", text)
+        self.assertIn("▰", text)
+        self.assertIn("▱", text)
 
     def test_upload_progress_reaches_one_hundred_percent(self) -> None:
         self.assertIn("100%", format_progress("upload", 1024, 1024))

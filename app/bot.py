@@ -2083,16 +2083,22 @@ def format_progress(stage: str, current: int, total: int) -> str:
     }
     label = labels.get(stage, "正在处理")
     ratio = min(1.0, max(0.0, current / total)) if total > 0 else 0.0
-    filled = round(ratio * 12)
-    bar = "#" * filled + "-" * (12 - filled)
+    width = 12
+    filled = round(ratio * width)
+    if 0 < ratio < 1:
+        filled = min(width - 1, max(1, filled))
+    bar = "▰" * filled + "▱" * (width - filled)
     percent = round(ratio * 100)
     if stage == "frames" and total > 0:
-        detail = f" {current}/{total}"
+        detail = f"{current}/{total}"
     elif stage in {"upload", "pack", "pack_media", "remux_dl"} and total > 0:
-        detail = f" {_fmt_mb(current)}/{_fmt_mb(total)}"
+        detail = f"{_fmt_mb(current)} / {_fmt_mb(total)}"
     else:
         detail = ""
-    return f"{label}{detail}\n[{bar}] {percent}%"
+    lines = [label, f"{bar}  {percent}%"]
+    if detail:
+        lines.append(detail)
+    return "\n".join(lines)
 
 
 def short_filename(name: str) -> str:
@@ -2232,16 +2238,17 @@ class ProgressReporter:
         existing_id: int | None = None,
         buttons=None,
     ) -> "ProgressReporter":
-        start_text = "收到，准备按需读取视频分块。大视频不会预先完整下载。"
+        start_text = format_progress("metadata", 0, 1)
         if existing_id is not None:
             reporter = cls(client, chat_id, existing_id)
             await reporter._edit(start_text)
             return reporter
+        # Reply keyboards make this message uneditable (MessageIdInvalidError),
+        # so the progress bar never appears. Keep the keyboard off this message.
         message = await client.send_message(
             chat_id,
             start_text,
             reply_to=reply_to,
-            buttons=buttons,
         )
         return cls(client, chat_id, message.id)
 
@@ -2290,7 +2297,7 @@ class ProgressReporter:
             await self.client.edit_message(self.chat_id, self.message_id, text)
             self.last_text = text
         except Exception as exc:
-            logging.warning("Could not update progress message (%s)", type(exc).__name__)
+            logging.warning("Could not update progress message (%s: %s)", type(exc).__name__, exc)
 
 
 def user_error_message(exc: Exception) -> str:
@@ -2486,14 +2493,14 @@ async def process_message(
                 opening = await _send_text_quoting(
                     client,
                     peer,
-                    "收到，准备按需读取视频分块。大视频不会预先完整下载。",
+                    format_progress("metadata", 0, 1),
                     reply_id,
                     quote_top_id,
                 )
                 progress = ProgressReporter(client, chat_id, opening.id)
             else:
                 progress = await ProgressReporter.create(
-                    client, chat_id, reply_id, existing_id=ticket.status_id, buttons=menu,
+                    client, chat_id, reply_id, existing_id=ticket.status_id,
                 )
             file_size = video.get("file_size")
             if not isinstance(file_size, int) or file_size <= 0:
