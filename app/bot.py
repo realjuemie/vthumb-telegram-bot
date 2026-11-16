@@ -10,7 +10,7 @@ import socket
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from telethon import Button, TelegramClient, events, functions, types
 from telethon.errors import FloodWaitError
@@ -657,25 +657,47 @@ def _announce_edit_text(message: Any) -> str | None:
     return text
 
 
+class AnnounceResult(NamedTuple):
+    """What a broadcast achieved. `wait` > 0 means Telegram stopped it."""
+
+    sent: int
+    failed: int
+    unsent: int = 0
+    wait: int = 0
+
+
 async def _publish_announce(
     client: TelegramClient,
     text: str,
     recipients: list[int],
     audience: Audience | None = None,
-) -> tuple[int, int]:
+) -> "AnnounceResult":
+    # Telegram shares one send deadline across SendMessage and SendMedia, so a
+    # blocked account drops every recipient. Trying anyway only extends it.
+    wait = _flood.remaining(FLOOD_MEDIA)
+    if wait > 0:
+        return AnnounceResult(0, 0, len(recipients), wait)
     sent = 0
     failed = 0
-    for user_id in recipients:
+    for index, user_id in enumerate(recipients):
         try:
             await client.send_message(user_id, text, parse_mode="md", link_preview=False)
             sent += 1
+        except FloodWaitError as exc:
+            wait = _flood.note_error(exc, FLOOD_MEDIA)
+            logging.warning(
+                "Announce paused for %s; %s recipients not attempted",
+                describe_wait(wait),
+                len(recipients) - index,
+            )
+            return AnnounceResult(sent, failed, len(recipients) - index, wait)
         except Exception as exc:
-            if audience is not None and type(exc).__name__ == "PeerIdInvalidError":
+            if audience is not None and type(exc).__name__ in {"PeerIdInvalidError", "UserIsBlockedError"}:
                 audience.discard(user_id)
             logging.warning("announce delivery failed for %s", user_id, exc_info=True)
             failed += 1
         await asyncio.sleep(0.05)
-    return sent, failed
+    return AnnounceResult(sent, failed)
 
 
 def command_user_id(text: str) -> int | None:
@@ -3150,9 +3172,24 @@ async def poll() -> None:
         await event.answer("开始发布")
         with contextlib.suppress(Exception):
             await event.edit(f"正在发布公告… 共 {len(recipients)} 人", buttons=None)
-        sent, failed = await _publish_announce(mt_client, text, recipients, _audience)
+        result = await _publish_announce(mt_client, text, recipients, _audience)
+        if result.wait:
+            if result.sent:
+                summary = (
+                    f"公告只发出一部分。成功 {result.sent} 人，失败 {result.failed} 人，"
+                    f"还有 {result.unsent} 人没发。\n"
+                    f"账号还在被 Telegram 限制，预计还要等 {describe_wait(result.wait)}，"
+                    "之后再发一次即可。"
+                )
+            else:
+                summary = (
+                    "公告没有发出。账号还在被 Telegram 限制，"
+                    f"预计还要等 {describe_wait(result.wait)}。"
+                )
+        else:
+            summary = f"公告已发布。成功 {result.sent} 人，失败 {result.failed} 人。"
         with contextlib.suppress(Exception):
-            await event.edit(f"公告已发布。成功 {sent} 人，失败 {failed} 人。")
+            await event.edit(summary)
 
     @mt_client.on(events.CallbackQuery(pattern=b"^pack:"))
     async def on_pack_offer(event: events.CallbackQuery.Event) -> None:
