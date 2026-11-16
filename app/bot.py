@@ -2361,8 +2361,9 @@ class JobQueue:
 _flood: FloodGate = FloodGate()
 
 # Seconds between two progress-bar edits. Each edit of the same message counts
-# against Telegram's anti-flood; 1.2 s was too eager.
-PROGRESS_EDIT_INTERVAL = 3.0
+# against Telegram's anti-flood, and bots get about 20 edits per minute per
+# chat: the old 1.2 s loop (50/min) is what triggered the first flood.
+PROGRESS_EDIT_INTERVAL = 4.0
 
 
 def _is_flood_error(exc: BaseException) -> bool:
