@@ -57,6 +57,7 @@ class Settings:
     ad_reward: int = 5
     adsgram_claims: str = ""
     ads_enabled: bool = False
+    ads_live: bool = False
 
     @property
     def mt_proxy(self) -> dict[str, object] | None:
@@ -128,4 +129,5 @@ class Settings:
             ad_reward=max(1, _int_env("AD_REWARD", 5)),
             adsgram_claims=(os.getenv("ADSGRAM_CLAIMS") or "").strip(),
             ads_enabled=_bool_env("ADS_ENABLED", False),
+            ads_live=_bool_env("ADS_LIVE", False),
         )

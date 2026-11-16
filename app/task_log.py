@@ -181,6 +181,33 @@ class TaskLog:
         self._save()
         return count
 
+    def refund(self, user_id: int, now: datetime | None = None) -> bool:
+        """Give back one slot taken by `consume`, for a job that produced nothing.
+
+        `consume` spends today's allowance first and a stored credit only once
+        that is used up, and the ledger does not record which one it took. Both
+        are worth one generation, so returning a slot to whichever counter is
+        non-zero restores the user's position without over-granting.
+        """
+        key = str(user_id)
+        day = today_key(now)
+        entry = dict(self.quota.get(key) or {})
+        if entry.get("date") != day:
+            return False
+        count = int(entry.get("count") or 0)
+        stored = max(0, int(entry.get("stored") or 0))
+        if count > 0:
+            count -= 1
+        elif stored > 0:
+            stored += 1
+        else:
+            return False
+        entry["count"] = count
+        entry["stored"] = stored
+        self.quota[key] = entry
+        self._save()
+        return True
+
     def add_stored_many(self, user_ids, amount: int) -> int:
         """Add persistent credits. Does not touch today's daily count."""
         if amount < 1:

@@ -13,12 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from telethon import Button, TelegramClient, events, functions, types
+from telethon.errors import FloodWaitError
 from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions import SQLiteSession
 
 from .access_control import AccessControl, GroupAccess
 from .adsgram import consume_claims, fetch_ad, numeric_block_id
 from .announce import Audience, announce_body, private_sender_id
+from .flood_gate import EDIT as FLOOD_EDIT
+from .flood_gate import MEDIA as FLOOD_MEDIA
+from .flood_gate import FloodGate, describe_wait
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
 from .settings import Settings
@@ -831,7 +835,7 @@ async def handle_command(
                 "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。\n"
                 "9. 已授权的群里，回复视频并发送 /thumb。任务和私聊共用队列。"
             )
-            if settings.ads_enabled:
+            if settings.ads_live:
                 text += "\n10. 点「看广告」后，先点广告，再点领取。到账后我会告诉你。"
             if not _is_group_message(message):
                 text += "\n\n也可以直接点下方按钮。"
@@ -845,7 +849,7 @@ async def handle_command(
                     "使用以前的生成结果不计入次数。"
                     " /checkin 每天可额外获得 1 到 3 次，存在储存次数里。"
                 )
-                if settings.ads_enabled:
+                if settings.ads_live:
                     text += f" 看广告可获得 {settings.ad_reward} 次，也存在储存次数里。"
                 if guests_closed(access, guest_gate, user_id):
                     text += "\n\n" + GUEST_CLOSED_TEXT
@@ -890,6 +894,8 @@ async def handle_command(
             return True
         if not settings.ads_enabled:
             text = "广告功能未开启。"
+        elif not settings.ads_live:
+            text = "看广告还未接入。"
         elif guests_closed(access, guest_gate, user_id):
             text = GUEST_CLOSED_TEXT
         else:
@@ -2352,6 +2358,36 @@ class JobQueue:
                 logging.warning("Could not update queue message (%s)", type(exc).__name__)
 
 
+_flood: FloodGate = FloodGate()
+
+
+def _is_flood_error(exc: BaseException) -> bool:
+    return isinstance(exc, FloodWaitError)
+
+
+async def _send_flood_notice(
+    client: TelegramClient,
+    message: Any,
+    wait: int,
+    is_admin: bool,
+) -> None:
+    """Tell the user why nothing happens, instead of retrying into a longer ban."""
+    text = (
+        f"Telegram 现在限制发送，预计还要等 {describe_wait(wait)}。\n"
+        "这段时间生成不了缩略图，稍后再发视频。"
+    )
+    buttons = _reply_menu(message, is_admin) if _is_private_message(message) else None
+    try:
+        await client.send_message(
+            message.chat_id,
+            text,
+            reply_to=message.id,
+            buttons=buttons,
+        )
+    except Exception:
+        logging.warning("Could not send flood notice", exc_info=True)
+
+
 class ProgressReporter:
     def __init__(self, client: TelegramClient, chat_id: int, message_id: int) -> None:
         self.client = client
@@ -2427,9 +2463,16 @@ class ProgressReporter:
     async def _edit(self, text: str) -> None:
         if text == self.last_text:
             return
+        # Retrying an edit while Telegram still enforces a FloodWait pushes the
+        # deadline further out, so stay quiet until it expires.
+        if _flood.remaining(FLOOD_EDIT) > 0:
+            return
         try:
             await self.client.edit_message(self.chat_id, self.message_id, text)
             self.last_text = text
+        except FloodWaitError as exc:
+            wait = _flood.note_error(exc, FLOOD_EDIT)
+            logging.warning("Progress edits paused for %s", describe_wait(wait))
         except Exception as exc:
             logging.warning("Could not update progress message (%s: %s)", type(exc).__name__, exc)
 
@@ -2742,7 +2785,16 @@ async def process_message(
         except Exception as exc:
             if range_key:
                 exc = media_server.failure(range_key) or exc
-            logging.exception("Failed to process message %s", message_id)
+            flood_wait = _flood.note_error(exc, FLOOD_MEDIA) if _is_flood_error(exc) else 0
+            if flood_wait:
+                # Not a bug in the job: Telegram asked us to stop sending.
+                logging.warning(
+                    "Telegram rate-limited sends for message %s; sends paused for %s",
+                    message_id,
+                    describe_wait(flood_wait),
+                )
+            else:
+                logging.exception("Failed to process message %s", message_id)
             # When ffmpeg (or another subprocess) failed, log the captured stderr
             # at WARNING level so the operator sees it in `docker logs` immediately.
             # `logging.exception` already records the traceback, this is the
@@ -2756,7 +2808,22 @@ async def process_message(
                     stderr_text,
                 )
             try:
-                error_text = "处理失败：" + user_error_message(exc)
+                if flood_wait:
+                    error_text = (
+                        "处理失败：Telegram 限制发送，预计还要等 "
+                        f"{describe_wait(flood_wait)}。"
+                    )
+                    # Nothing was delivered, so do not eat the caller's slot.
+                    payer = preference_user_id if preference_user_id is not None else message.sender_id
+                    if (
+                        task_log is not None
+                        and payer is not None
+                        and access is not None
+                        and not access.has_grant(payer)
+                    ):
+                        task_log.refund(payer)
+                else:
+                    error_text = "处理失败：" + user_error_message(exc)
                 if progress:
                     await progress.finish(error_text)
                 elif quote_msg_id and peer is not None:
@@ -2810,6 +2877,14 @@ async def poll() -> None:
     )
     global _audience
     _audience = Audience(Path(settings.access_file).with_name("audience.json"))
+    global _flood
+    _flood = FloodGate(Path(settings.access_file).with_name("flood.json"))
+    flood_left = _flood.remaining(FLOOD_MEDIA)
+    if flood_left:
+        logging.warning(
+            "Telegram is still rate-limiting sends: %s left. New jobs will be declined until then.",
+            describe_wait(flood_left),
+        )
     groups = GroupAccess(Path(settings.access_file).with_name("groups.json"))
     tasks: set[asyncio.Task[None]] = set()
 
@@ -2826,6 +2901,13 @@ async def poll() -> None:
         mention_label: str | None = None,
     ) -> None:
         user_id = preference_user_id if preference_user_id is not None else message.sender_id
+        wait = _flood.remaining(FLOOD_MEDIA)
+        if wait > 0:
+            # Do not consume a slot or spend two minutes reading the video when
+            # the finished sheet cannot be sent anyway.
+            is_admin = bool(access is not None and user_id is not None and access.is_admin(user_id))
+            asyncio.create_task(_send_flood_notice(mt_client, message, wait, is_admin))
+            return
         if user_id is not None and not access.has_grant(user_id):
             task_log.consume(user_id)
         task = asyncio.create_task(
@@ -2945,7 +3027,7 @@ async def poll() -> None:
         if not access.has_grant(event.sender_id) and not task_log.can_generate(event.sender_id):
             await mt_client.send_message(
                 event.chat_id,
-                quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_enabled),
+                quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live),
                 reply_to=event.message.id,
                 buttons=main_menu(access.is_admin(event.sender_id)) if event.is_private else None,
             )
@@ -2996,10 +3078,10 @@ async def poll() -> None:
                 )
             return
         if not access.has_grant(requester) and not task_log.can_generate(requester):
-            await event.answer("今天的次数已用完，可先签到" + ("或看广告" if settings.ads_enabled else ""), alert=True)
+            await event.answer("今天的次数已用完，可先签到" + ("或看广告" if settings.ads_live else ""), alert=True)
             with contextlib.suppress(Exception):
                 await event.edit(
-                    quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_enabled),
+                    quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live),
                     buttons=None,
                 )
             return
