@@ -2360,6 +2360,10 @@ class JobQueue:
 
 _flood: FloodGate = FloodGate()
 
+# Seconds between two progress-bar edits. Each edit of the same message counts
+# against Telegram's anti-flood; 1.2 s was too eager.
+PROGRESS_EDIT_INTERVAL = 3.0
+
 
 def _is_flood_error(exc: BaseException) -> bool:
     return isinstance(exc, FloodWaitError)
@@ -2397,6 +2401,7 @@ class ProgressReporter:
         self.state: tuple[str, int, int] = ("metadata", 0, 1)
         self.last_text = ""
         self.dirty = True
+        self.last_edit_at = 0.0
         self.task = asyncio.create_task(self._run())
 
     @classmethod
@@ -2434,7 +2439,7 @@ class ProgressReporter:
 
     async def show_now(self, stage: str, current: int, total: int) -> None:
         self._set_state(stage, current, total)
-        await self._flush()
+        await self._flush(force=True)
 
     async def finish(self, text: str) -> None:
         self.task.cancel()
@@ -2454,8 +2459,14 @@ class ProgressReporter:
             await asyncio.sleep(1.2)
             await self._flush()
 
-    async def _flush(self) -> None:
+    async def _flush(self, force: bool = False) -> None:
         if not self.dirty:
+            return
+        # Every edit of the same message counts against Telegram's anti-flood.
+        # A progress bar refreshed every 1.2 s for several minutes per job was
+        # what pushed this account into an 800 s EditMessageRequest wait, so
+        # refresh at most once per PROGRESS_EDIT_INTERVAL.
+        if not force and time.monotonic() - self.last_edit_at < PROGRESS_EDIT_INTERVAL:
             return
         self.dirty = False
         await self._edit(format_progress(*self.state))
@@ -2470,6 +2481,7 @@ class ProgressReporter:
         try:
             await self.client.edit_message(self.chat_id, self.message_id, text)
             self.last_text = text
+            self.last_edit_at = time.monotonic()
         except FloodWaitError as exc:
             wait = _flood.note_error(exc, FLOOD_EDIT)
             logging.warning("Progress edits paused for %s", describe_wait(wait))
