@@ -2259,13 +2259,14 @@ def format_queue_status(ahead: int, filename: str) -> str:
 
 
 class QueueTicket:
-    __slots__ = ("client", "chat_id", "filename", "status_id")
+    __slots__ = ("client", "chat_id", "filename", "status_id", "last_ahead")
 
     def __init__(self, client: TelegramClient, chat_id: int, filename: str) -> None:
         self.client = client
         self.chat_id = chat_id
         self.filename = filename
         self.status_id: int | None = None
+        self.last_ahead: int | None = None
 
 
 class JobQueue:
@@ -2318,6 +2319,7 @@ class JobQueue:
                             reply_to=reply_to,
                         )
                     ticket.status_id = msg.id
+                    ticket.last_ahead = ahead
                 except Exception as exc:
                     logging.warning("Could not send queue message (%s)", type(exc).__name__)
             await self._sema.acquire()
@@ -2344,16 +2346,29 @@ class JobQueue:
         await self._notify_waiters(snapshot, running)
 
     async def _notify_waiters(self, waiters: list[QueueTicket], running: int) -> None:
+        # Every waiter in the same group is one more edit in that same chat, and
+        # bots only get about 20 edits per minute per chat. A joiner appends at
+        # the end, so the people already queued keep their position: skip the
+        # edit when the number on screen would not change.
+        if _flood.remaining(FLOOD_EDIT) > 0:
+            return
         for index, ticket in enumerate(waiters):
             if ticket.status_id is None:
                 continue
             ahead = index + running
+            if ticket.last_ahead == ahead:
+                continue
+            ticket.last_ahead = ahead
             try:
                 await ticket.client.edit_message(
                     ticket.chat_id,
                     ticket.status_id,
                     format_queue_status(ahead, ticket.filename),
                 )
+            except FloodWaitError as exc:
+                wait = _flood.note_error(exc, FLOOD_EDIT)
+                logging.warning("Queue notices paused for %s", describe_wait(wait))
+                return
             except Exception as exc:
                 logging.warning("Could not update queue message (%s)", type(exc).__name__)
 
