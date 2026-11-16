@@ -17,6 +17,7 @@ from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.sessions import SQLiteSession
 
 from .access_control import AccessControl, GroupAccess
+from .adsgram import consume_claims, fetch_ad, numeric_block_id
 from .announce import Audience, announce_body, private_sender_id
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
@@ -71,14 +72,19 @@ def _install_fast_upload(client: TelegramClient) -> None:
 
     client.upload_file = upload_file  # type: ignore[method-assign]
 
-BOT_COMMANDS = (
+USER_COMMANDS = (
     ("start", "开始使用并查看视频发送方式"),
-    ("help", "查看使用说明和自适应读取策略"),
+    ("help", "查看使用说明"),
     ("status", "查看缩略图设置和读取预算"),
     ("setting", "选择每个用户独立的缩略图预设"),
     ("id", "查看自己的 Telegram 用户 ID"),
     ("info", "查看账号、授权状态和今日剩余次数"),
-    ("checkin", "每日签到，获得可储存的使用次数"),
+    ("checkin", "每日签到，获得 1 到 3 次储存次数"),
+    ("ad", "看广告，获得 5 次储存次数"),
+    ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
+    ("thumb", "回复一条视频，生成缩略图"),
+)
+ADMIN_COMMANDS = (
     ("add", "管理员：添加授权用户"),
     ("del", "管理员：删除授权用户"),
     ("users", "管理员：查看授权用户"),
@@ -86,16 +92,16 @@ BOT_COMMANDS = (
     ("bonus", "管理员：给非授权用户增加储存次数"),
     ("announce", "管理员：预览并发布 Markdown 公告"),
     ("group", "管理员：在群里授权该群使用缩略图"),
-    ("thumb", "回复一条视频，生成缩略图"),
-    ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
 )
+BOT_COMMANDS = USER_COMMANDS + ADMIN_COMMANDS
 
 # Bottom reply keyboard in private chats. Labels are exact message text.
 # Do not put the admin-forward toggle here — that stays on /setting only.
 # /group and /thumb stay slash-only: they only work as a reply inside a group.
 USER_MENU_ROWS = (
     ("使用说明", "我的设置", "运行状态"),
-    ("我的信息", "每日签到", "合并消息", "取消合并"),
+    ("我的信息", "每日签到", "看广告"),
+    ("合并消息", "取消合并"),
 )
 ADMIN_MENU_ROWS = (
     ("授权名单", "发布公告"),
@@ -107,6 +113,7 @@ MENU_ACTIONS = {
     "运行状态": "/status",
     "我的信息": "/info",
     "每日签到": "/checkin",
+    "看广告": "/ad",
     "合并消息": "/merge",
     "取消合并": "/merge cancel",
     "授权名单": "/users",
@@ -186,12 +193,14 @@ def permission_message(user_id: int | None) -> str:
     return f"你还没有使用权限。\n你的 Telegram ID：{user_id or '未知'}\n请将此 ID 提供给管理员添加。"
 
 
-def quota_message(limit: int, community_url: str) -> str:
+def quota_message(limit: int, community_url: str, ad_reward: int = 5, ads_enabled: bool = False) -> str:
     text = (
         f"今天的 {limit} 次生成已经用完，储存次数也没有了。\n"
-        "发送 /checkin 每天可再获得 1 到 10 次。\n"
-        "请通过社群群聊联系开发者升级权限。"
+        "发送 /checkin 每天可再获得 1 到 3 次。\n"
     )
+    if ads_enabled:
+        text += f"看广告可获得 {ad_reward} 次。点开广告后再点领取。\n"
+    text += "请通过社群群聊联系开发者升级权限。"
     if community_url:
         text += f"\n{community_url}"
     return text
@@ -327,10 +336,18 @@ def _is_private_message(message: Any) -> bool:
     return getattr(message, "is_private", None) is True
 
 
-def menu_rows(is_admin: bool) -> tuple[tuple[str, ...], ...]:
+_ads_enabled = False
+
+
+def menu_rows(is_admin: bool, ads_enabled: bool | None = None) -> tuple[tuple[str, ...], ...]:
+    enabled = _ads_enabled if ads_enabled is None else ads_enabled
+    rows = USER_MENU_ROWS
+    if not enabled:
+        rows = tuple(tuple(label for label in row if label != "看广告") for row in rows)
+        rows = tuple(row for row in rows if row)
     if is_admin:
-        return USER_MENU_ROWS + ADMIN_MENU_ROWS
-    return USER_MENU_ROWS
+        return rows + ADMIN_MENU_ROWS
+    return rows
 
 
 def menu_action(text: str | None) -> str | None:
@@ -814,6 +831,8 @@ async def handle_command(
                 "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。\n"
                 "9. 已授权的群里，回复视频并发送 /thumb。任务和私聊共用队列。"
             )
+            if settings.ads_enabled:
+                text += "\n10. 点「看广告」后，先点广告，再点领取。到账后我会告诉你。"
             if not _is_group_message(message):
                 text += "\n\n也可以直接点下方按钮。"
             if is_admin:
@@ -824,8 +843,10 @@ async def handle_command(
                 text += (
                     f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
                     "使用以前的生成结果不计入次数。"
-                    " /checkin 每天可额外获得 1 到 10 次，存在储存次数里。"
+                    " /checkin 每天可额外获得 1 到 3 次，存在储存次数里。"
                 )
+                if settings.ads_enabled:
+                    text += f" 看广告可获得 {settings.ad_reward} 次，也存在储存次数里。"
                 if guests_closed(access, guest_gate, user_id):
                     text += "\n\n" + GUEST_CLOSED_TEXT
     elif command == "id":
@@ -864,6 +885,16 @@ async def handle_command(
                     f"签到成功，获得 {gained} 次。储存次数：{total}\n"
                     f"这些次数可以留着，不占每天的 {settings.guest_daily_limit} 次。"
                 )
+    elif command == "ad":
+        if _is_group_message(message):
+            return True
+        if not settings.ads_enabled:
+            text = "广告功能未开启。"
+        elif guests_closed(access, guest_gate, user_id):
+            text = GUEST_CLOSED_TEXT
+        else:
+            await _send_watch_ad(client, settings, message, is_admin)
+            return True
     elif command == "status":
         if not is_allowed:
             text = permission_message(user_id)
@@ -2013,14 +2044,117 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
 _pending_merge: dict[int, dict] = {}
 
 
-async def set_bot_commands(client: TelegramClient) -> None:
+async def set_bot_commands(client: TelegramClient, admin_ids: frozenset[int] | set[int] = frozenset(), ads_enabled: bool = False) -> None:
+    def listed(pairs):
+        return [types.BotCommand(command=name, description=description) for name, description in pairs]
+
+    user_pairs = USER_COMMANDS if ads_enabled else tuple(item for item in USER_COMMANDS if item[0] != "ad")
     await client(
         functions.bots.SetBotCommandsRequest(
             scope=types.BotCommandScopeDefault(),
             lang_code="",
-            commands=[types.BotCommand(command=name, description=description) for name, description in BOT_COMMANDS],
+            commands=listed(user_pairs),
         )
     )
+    admin_pairs = user_pairs + ADMIN_COMMANDS
+    for admin_id in admin_ids:
+        try:
+            peer = await client.get_input_entity(int(admin_id))
+        except Exception:
+            logging.warning("Could not set admin command menu for %s", admin_id)
+            continue
+        await client(
+            functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopePeer(peer),
+                lang_code="",
+                commands=listed(admin_pairs),
+            )
+        )
+
+
+async def _send_watch_ad(client: TelegramClient, settings: Settings, message: Any, is_admin: bool) -> None:
+    chat_id = message.chat_id
+    user_id = message.sender_id
+    block = numeric_block_id(settings.adsgram_block_id)
+    if not block or not settings.adsgram_token or user_id is None:
+        await client.send_message(
+            chat_id,
+            "看广告还没接上，稍后再试。",
+            reply_to=message.id,
+            buttons=_reply_menu(message, is_admin),
+        )
+        return
+    try:
+        ad = await asyncio.to_thread(fetch_ad, block, settings.adsgram_token, int(user_id))
+    except Exception:
+        logging.exception("Could not fetch ad")
+        ad = None
+    if not ad:
+        await client.send_message(
+            chat_id,
+            "暂时没有广告，请稍后再试。",
+            reply_to=message.id,
+            buttons=_reply_menu(message, is_admin),
+        )
+        return
+    buttons = [[Button.url(ad["button_name"], ad["click_url"])]]
+    if ad["reward_url"]:
+        buttons.append([Button.url(ad["button_reward_name"], ad["reward_url"])])
+    sent = False
+    if ad["image_url"]:
+        try:
+            await client.send_file(
+                chat_id,
+                ad["image_url"],
+                caption=ad["text_html"],
+                parse_mode="html",
+                buttons=buttons,
+                noforwards=True,
+                reply_to=message.id,
+            )
+            sent = True
+        except Exception:
+            logging.exception("Could not send ad image")
+    if not sent:
+        await client.send_message(
+            chat_id,
+            ad["text_html"],
+            parse_mode="html",
+            link_preview=False,
+            buttons=buttons,
+            noforwards=True,
+            reply_to=message.id,
+        )
+    await client.send_message(
+        chat_id,
+        f"先点广告，再点领取。到账 {settings.ad_reward} 次后我会告诉你。",
+        reply_to=message.id,
+        buttons=_reply_menu(message, is_admin),
+    )
+
+
+async def _claim_loop(client: TelegramClient, settings: Settings, task_log: TaskLog, access: AccessControl) -> None:
+    if not settings.adsgram_claims:
+        return
+    path = Path(settings.adsgram_claims)
+    state = path.with_name("claims.state.json")
+    while True:
+        try:
+            user_ids = await asyncio.to_thread(consume_claims, path, state, int(time.time()))
+            for user_id in user_ids:
+                task_log.add_stored_many([user_id], settings.ad_reward)
+                total = task_log.stored_credits(user_id)
+                try:
+                    await client.send_message(
+                        user_id,
+                        f"看广告到账，获得 {settings.ad_reward} 次。储存次数：{total}",
+                        buttons=main_menu(access.is_admin(user_id)),
+                    )
+                except Exception:
+                    logging.info("Could not notify ad reward for %s", user_id)
+        except Exception:
+            logging.exception("ad claim poll failed")
+        await asyncio.sleep(5)
 
 
 class RedactingFormatter(logging.Formatter):
@@ -2811,7 +2945,7 @@ async def poll() -> None:
         if not access.has_grant(event.sender_id) and not task_log.can_generate(event.sender_id):
             await mt_client.send_message(
                 event.chat_id,
-                quota_message(settings.guest_daily_limit, settings.community_url),
+                quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_enabled),
                 reply_to=event.message.id,
                 buttons=main_menu(access.is_admin(event.sender_id)) if event.is_private else None,
             )
@@ -2862,9 +2996,12 @@ async def poll() -> None:
                 )
             return
         if not access.has_grant(requester) and not task_log.can_generate(requester):
-            await event.answer("今天的次数已用完，可先 /checkin", alert=True)
+            await event.answer("今天的次数已用完，可先签到" + ("或看广告" if settings.ads_enabled else ""), alert=True)
             with contextlib.suppress(Exception):
-                await event.edit(quota_message(settings.guest_daily_limit, settings.community_url), buttons=None)
+                await event.edit(
+                    quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_enabled),
+                    buttons=None,
+                )
             return
         _drop_reuse_offer(token)
         await event.answer("开始重新生成")
@@ -2965,9 +3102,14 @@ async def poll() -> None:
                 buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward),
             )
 
+    claim_task: asyncio.Task[None] | None = None
     try:
         await mt_client.start(bot_token=settings.bot_token)
-        await set_bot_commands(mt_client)
+        await set_bot_commands(mt_client, settings.admin_ids, settings.ads_enabled)
+        global _ads_enabled
+        _ads_enabled = settings.ads_enabled
+        claim_task = asyncio.create_task(_claim_loop(mt_client, settings, task_log, access))
+        tasks.add(claim_task)
         await media_server.start()
         logging.info(
             "vthumb Telegram bot started with MTProto range reading. upload_part_size_kb=%s tcp_keepalive=on",
@@ -2975,6 +3117,8 @@ async def poll() -> None:
         )
         await mt_client.run_until_disconnected()
     finally:
+        if claim_task is not None:
+            claim_task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await media_server.stop()

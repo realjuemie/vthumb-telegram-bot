@@ -52,6 +52,11 @@ class Settings:
     preferences_file: str
     guest_daily_limit: int
     community_url: str
+    adsgram_block_id: str = ""
+    adsgram_token: str = ""
+    ad_reward: int = 5
+    adsgram_claims: str = ""
+    ads_enabled: bool = False
 
     @property
     def mt_proxy(self) -> dict[str, object] | None:
@@ -118,4 +123,9 @@ class Settings:
             preferences_file=os.getenv("PREFERENCES_FILE", "/data/preferences.json"),
             guest_daily_limit=_int_env("GUEST_DAILY_LIMIT", 10),
             community_url=(os.getenv("COMMUNITY_URL") or "").strip(),
+            adsgram_block_id=(os.getenv("ADSGRAM_BLOCK_ID") or "").strip(),
+            adsgram_token=(os.getenv("ADSGRAM_TOKEN") or "").strip(),
+            ad_reward=max(1, _int_env("AD_REWARD", 5)),
+            adsgram_claims=(os.getenv("ADSGRAM_CLAIMS") or "").strip(),
+            ads_enabled=_bool_env("ADS_ENABLED", False),
         )

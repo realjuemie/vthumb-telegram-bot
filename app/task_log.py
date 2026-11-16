@@ -138,12 +138,12 @@ class TaskLog:
         return entry.get("checkin") == today_key(now)
 
     def check_in(self, user_id: int, now: datetime | None = None, roll=None) -> tuple[int, int] | None:
-        """Grant 1-10 stored credits once per day. None if already checked in."""
+        """Grant 1-3 stored credits once per day. None if already checked in."""
         if self.checked_in_on(user_id, now):
             return None
-        gained = int((roll or random.randint)(1, 10))
-        if gained < 1 or gained > 10:
-            raise ValueError("check-in reward must be from 1 to 10")
+        gained = int((roll or random.randint)(1, 3))
+        if gained < 1 or gained > 3:
+            raise ValueError("check-in reward must be from 1 to 3")
         key = str(user_id)
         day = today_key(now)
         entry = dict(self.quota.get(key) or {})

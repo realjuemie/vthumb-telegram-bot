@@ -3,6 +3,8 @@ import unittest
 
 from app.bot import (
     BOT_COMMANDS,
+    USER_COMMANDS,
+    ADMIN_COMMANDS,
     JobQueue,
     account_info_text,
     command_name,
@@ -46,6 +48,15 @@ class BotCommandTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(all(name.isascii() and name.islower() for name in names))
         self.assertNotIn("forward", names)
+        user_names = [name for name, _ in USER_COMMANDS]
+        admin_names = {name for name, _ in ADMIN_COMMANDS}
+        self.assertTrue(admin_names.isdisjoint(user_names))
+        self.assertIn("ad", user_names)
+        self.assertIn("add", admin_names)
+        hidden = [label for row in menu_rows(False, ads_enabled=False) for label in row]
+        shown = [label for row in menu_rows(False, ads_enabled=True) for label in row]
+        self.assertNotIn("看广告", hidden)
+        self.assertIn("看广告", shown)
 
     def test_reply_menu_maps_labels_and_hides_admin_rows(self) -> None:
         self.assertEqual(menu_action("  使用说明  "), "/help")
@@ -70,6 +81,9 @@ class BotCommandTests(unittest.TestCase):
         self.assertIsNone(private_menu_action(group))
         tap = type("M", (), {"is_private": True, "media": None, "document": None, "raw_text": "每日签到"})()
         self.assertEqual(private_menu_action(tap), "/checkin")
+        ad = type("M", (), {"is_private": True, "media": None, "document": None, "raw_text": "看广告"})()
+        self.assertEqual(private_menu_action(ad), "/ad")
+        self.assertNotIn("看广告", guest)
 
     def test_guest_bonus_targets_skip_granted_users(self) -> None:
         import tempfile
