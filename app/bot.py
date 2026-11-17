@@ -1350,6 +1350,8 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
             return
 
         for batch_start in range(0, len(media), BATCH):
+            if _flood.remaining(FLOOD_MEDIA) > 0:
+                break
             batch = media[batch_start:batch_start + BATCH]
             try:
                 await client.send_file(
@@ -1358,9 +1360,15 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
                     force_document=needs_file_album,
                 )
                 sent += len(batch)
+            except FloodWaitError as exc:
+                _flood.note_error(exc, FLOOD_MEDIA)
+                break
             except Exception as e:
                 err = str(e).lower()
                 logging.warning(f"{MERGE_LOG_PREFIX} uid={user_id} batch failed: {e}")
+                if _is_flood_error(e):
+                    _flood.note_error(e, FLOOD_MEDIA)
+                    break
                 if any(tok in err for tok in (
                     "file_id_invalid", "media_invalid", "file reference",
                     "invalid file", "wrong file id", "media_empty",
@@ -2384,29 +2392,19 @@ class JobQueue:
         async with self._lock:
             ahead = self._running + len(self._waiters)
             self._waiters.append(ticket)
+        # Claim the slot before any Telegram await. A slow queue notice must
+        # not let a later job that finishes its notice first jump the queue.
+        notice: asyncio.Task[None] | None = None
+        if ahead > 0:
+            notice = asyncio.create_task(self._send_queue_notice(
+                ticket, client, chat_id, reply_to, filename, ahead,
+                quote_top_id=quote_top_id, peer=peer,
+            ))
         try:
-            if ahead > 0:
-                try:
-                    if peer is not None:
-                        msg = await _send_text_quoting(
-                            client,
-                            peer,
-                            format_queue_status(ahead, filename),
-                            reply_to,
-                            quote_top_id,
-                        )
-                    else:
-                        msg = await client.send_message(
-                            chat_id,
-                            format_queue_status(ahead, filename),
-                            reply_to=reply_to,
-                        )
-                    ticket.status_id = msg.id
-                    ticket.last_ahead = ahead
-                except Exception as exc:
-                    logging.warning("Could not send queue message (%s)", type(exc).__name__)
             await self._sema.acquire()
         except BaseException:
+            if notice is not None:
+                notice.cancel()
             async with self._lock:
                 if ticket in self._waiters:
                     self._waiters.remove(ticket)
@@ -2419,6 +2417,44 @@ class JobQueue:
             running = self._running
         await self._notify_waiters(snapshot, running)
         return ticket
+
+    async def _send_queue_notice(
+        self,
+        ticket: QueueTicket,
+        client: TelegramClient,
+        chat_id: int,
+        reply_to: int,
+        filename: str,
+        ahead: int,
+        *,
+        quote_top_id: int | None,
+        peer: Any,
+    ) -> None:
+        if _flood.remaining(FLOOD_MEDIA) > 0:
+            return
+        try:
+            if peer is not None:
+                msg = await _send_text_quoting(
+                    client, peer, format_queue_status(ahead, filename), reply_to, quote_top_id,
+                )
+            else:
+                msg = await client.send_message(
+                    chat_id, format_queue_status(ahead, filename), reply_to=reply_to,
+                )
+        except FloodWaitError as exc:
+            _flood.note_error(exc, FLOOD_MEDIA)
+            return
+        except Exception as exc:
+            logging.warning("Could not send queue message (%s)", type(exc).__name__)
+            return
+        async with self._lock:
+            still_waiting = ticket in self._waiters
+        if not still_waiting:
+            with contextlib.suppress(Exception):
+                await client.delete_messages(chat_id, [msg.id])
+            return
+        ticket.status_id = msg.id
+        ticket.last_ahead = ahead
 
     async def leave(self) -> None:
         async with self._lock:
