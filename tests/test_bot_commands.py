@@ -201,7 +201,7 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         second = asyncio.create_task(job("two.mp4"))
         await asyncio.gather(first, second)
         self.assertEqual(started, ["one.mp4", "two.mp4"])
-        self.assertTrue(any("two.mp4" in text for text in client.sends))
+        self.assertFalse(any("two.mp4" in text for text in client.sends))
 
     def test_forward_command_parses(self) -> None:
         self.assertEqual(command_name("/forward on"), "forward")

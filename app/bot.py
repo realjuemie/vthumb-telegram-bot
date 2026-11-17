@@ -2388,6 +2388,20 @@ def format_queue_status(ahead: int, filename: str) -> str:
     )
 
 
+def format_queue_batch(waiting: int) -> str:
+    """One line for a whole chat, not one reply per file."""
+    count = max(1, int(waiting))
+    return (
+        "已加入队列，按到达顺序处理。\n"
+        f"后面还有 {count} 个\n"
+        "正在处理的会显示进度，轮到时自动开始。"
+    )
+
+
+# Quiet period so a burst of files is counted before the one notice goes out.
+QUEUE_BATCH_QUIET = 2.0
+
+
 class QueueTicket:
     __slots__ = ("client", "chat_id", "filename", "status_id", "last_ahead")
 
@@ -2408,6 +2422,8 @@ class JobQueue:
         self._lock = asyncio.Lock()
         self._waiters: list[QueueTicket] = []
         self._running = 0
+        self._batches: dict[int, dict] = {}
+        self.batch_quiet = QUEUE_BATCH_QUIET
 
     @property
     def running(self) -> int:
@@ -2431,105 +2447,142 @@ class JobQueue:
         async with self._lock:
             ahead = self._running + len(self._waiters)
             self._waiters.append(ticket)
-        # Claim the slot before any Telegram await. A slow queue notice must
-        # not let a later job that finishes its notice first jump the queue.
-        notice: asyncio.Task[None] | None = None
+            if ahead > 0:
+                self._bump_batch_locked(chat_id, client, reply_to, quote_top_id, peer)
+        # Claim the slot before any Telegram await. The summary is sent later,
+        # after a short quiet period, and must not affect who runs first.
         if ahead > 0:
-            notice = asyncio.create_task(self._send_queue_notice(
-                ticket, client, chat_id, reply_to, filename, ahead,
-                quote_top_id=quote_top_id, peer=peer,
-            ))
+            self._arm_batch(chat_id)
         try:
             await self._sema.acquire()
         except BaseException:
-            if notice is not None:
-                notice.cancel()
             async with self._lock:
                 if ticket in self._waiters:
                     self._waiters.remove(ticket)
+                    if ahead > 0:
+                        self._drop_batch_locked(chat_id)
+            if ahead > 0:
+                self._arm_batch(chat_id)
             raise
         async with self._lock:
             if ticket in self._waiters:
                 self._waiters.remove(ticket)
+                if ahead > 0:
+                    self._drop_batch_locked(chat_id)
             self._running += 1
-            snapshot = list(self._waiters)
-            running = self._running
-        await self._notify_waiters(snapshot, running)
+        if ahead > 0:
+            self._arm_batch(chat_id)
         return ticket
 
-    async def _send_queue_notice(
+    def _bump_batch_locked(
         self,
-        ticket: QueueTicket,
-        client: TelegramClient,
         chat_id: int,
+        client: TelegramClient,
         reply_to: int,
-        filename: str,
-        ahead: int,
-        *,
         quote_top_id: int | None,
         peer: Any,
     ) -> None:
-        if _flood.remaining(FLOOD_MEDIA) > 0:
+        state = self._batches.get(chat_id)
+        if state is None:
+            state = {
+                "waiting": 0,
+                "client": client,
+                "reply_to": reply_to,
+                "quote_top_id": quote_top_id,
+                "peer": peer,
+                "task": None,
+                "message_id": None,
+                "last_text": "",
+            }
+            self._batches[chat_id] = state
+        state["waiting"] += 1
+        state["client"] = client
+        if state["waiting"] == 1 and state.get("message_id") is None:
+            state["reply_to"] = reply_to
+            state["quote_top_id"] = quote_top_id
+            state["peer"] = peer
+
+    def _drop_batch_locked(self, chat_id: int) -> None:
+        state = self._batches.get(chat_id)
+        if state is None:
+            return
+        state["waiting"] = max(0, int(state["waiting"]) - 1)
+
+    def _arm_batch(self, chat_id: int, delay: float | None = None) -> None:
+        state = self._batches.get(chat_id)
+        if state is None:
+            return
+        current = asyncio.current_task()
+        task = state.get("task")
+        if task is not None and not task.done() and task is not current:
+            task.cancel()
+        state["task"] = asyncio.create_task(self._wait_batch(chat_id, self.batch_quiet if delay is None else delay))
+
+    async def _wait_batch(self, chat_id: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
             return
         try:
-            if peer is not None:
+            await self._flush_batch(chat_id)
+        except Exception:
+            logging.exception("queue summary failed")
+
+    async def _flush_batch(self, chat_id: int) -> None:
+        state = self._batches.get(chat_id)
+        if state is None:
+            return
+        waiting = int(state["waiting"])
+        client = state["client"]
+        if waiting <= 0:
+            message_id = state.get("message_id")
+            self._batches.pop(chat_id, None)
+            if message_id:
+                with contextlib.suppress(Exception):
+                    await client.delete_messages(chat_id, [message_id])
+            return
+        text = format_queue_batch(waiting)
+        if state.get("message_id") and text == state.get("last_text"):
+            return
+        if state.get("message_id"):
+            if _flood.remaining(FLOOD_EDIT) > 0:
+                return
+            try:
+                await client.edit_message(chat_id, state["message_id"], text)
+            except FloodWaitError as exc:
+                _flood.note_error(exc, FLOOD_EDIT)
+                logging.warning("Queue summary edit was refused; not retrying")
+                return
+            except Exception as exc:
+                logging.warning("Could not update queue summary (%s)", type(exc).__name__)
+                return
+            state["last_text"] = text
+            return
+        wait = _flood.remaining(FLOOD_MEDIA)
+        if wait > 0:
+            self._arm_batch(chat_id, wait + 1)
+            return
+        try:
+            if state.get("peer") is not None:
                 msg = await _send_text_quoting(
-                    client, peer, format_queue_status(ahead, filename), reply_to, quote_top_id,
+                    client, state["peer"], text, state["reply_to"], state.get("quote_top_id"),
                 )
             else:
-                msg = await client.send_message(
-                    chat_id, format_queue_status(ahead, filename), reply_to=reply_to,
-                )
+                msg = await client.send_message(chat_id, text, reply_to=state.get("reply_to"))
         except FloodWaitError as exc:
             _flood.note_error(exc, FLOOD_MEDIA)
+            logging.warning("Queue summary was refused; not retrying")
             return
         except Exception as exc:
-            logging.warning("Could not send queue message (%s)", type(exc).__name__)
+            logging.warning("Could not send queue summary (%s)", type(exc).__name__)
             return
-        async with self._lock:
-            still_waiting = ticket in self._waiters
-        if not still_waiting:
-            with contextlib.suppress(Exception):
-                await client.delete_messages(chat_id, [msg.id])
-            return
-        ticket.status_id = msg.id
-        ticket.last_ahead = ahead
+        state["message_id"] = getattr(msg, "id", None)
+        state["last_text"] = text
 
     async def leave(self) -> None:
         async with self._lock:
             self._running = max(0, self._running - 1)
-            snapshot = list(self._waiters)
-            running = self._running
         self._sema.release()
-        await self._notify_waiters(snapshot, running)
-
-    async def _notify_waiters(self, waiters: list[QueueTicket], running: int) -> None:
-        # Every waiter in the same group is one more edit in that same chat, and
-        # bots only get about 20 edits per minute per chat. A joiner appends at
-        # the end, so the people already queued keep their position: skip the
-        # edit when the number on screen would not change.
-        if _flood.remaining(FLOOD_EDIT) > 0:
-            return
-        for index, ticket in enumerate(waiters):
-            if ticket.status_id is None:
-                continue
-            ahead = index + running
-            if ticket.last_ahead == ahead:
-                continue
-            try:
-                await ticket.client.edit_message(
-                    ticket.chat_id,
-                    ticket.status_id,
-                    format_queue_status(ahead, ticket.filename),
-                )
-            except FloodWaitError as exc:
-                wait = _flood.note_error(exc, FLOOD_EDIT)
-                logging.warning("Queue notices paused for %s", describe_wait(wait))
-                return
-            except Exception as exc:
-                logging.warning("Could not update queue message (%s)", type(exc).__name__)
-                continue
-            ticket.last_ahead = ahead
 
 
 _flood: FloodGate = FloodGate()
