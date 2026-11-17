@@ -1,6 +1,7 @@
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from app.flood_gate import EDIT, MEDIA, FloodGate, describe_wait
@@ -78,6 +79,13 @@ class FloodGateTests(unittest.TestCase):
         self.assertEqual(describe_wait(61), "2 分钟")
         self.assertEqual(describe_wait(3600), "1 小时")
         self.assertEqual(describe_wait(4800), "1 小时 20 分钟")
+
+    def test_resume_clock_is_today_or_includes_the_date(self) -> None:
+        from app.flood_gate import resume_clock
+        now = 1_700_000_000.0
+        self.assertEqual(resume_clock(3600, now), datetime.fromtimestamp(now + 3600).strftime("%H:%M"))
+        later = resume_clock(26 * 3600, now)
+        self.assertEqual(later, datetime.fromtimestamp(now + 26 * 3600).strftime("%m-%d %H:%M"))
 
 
 if __name__ == "__main__":

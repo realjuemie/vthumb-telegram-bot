@@ -15,6 +15,7 @@ import math
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 MEDIA = "media"
@@ -100,3 +101,13 @@ def describe_wait(seconds: int) -> str:
     if rest:
         return f"{hours} 小时 {rest} 分钟"
     return f"{hours} 小时"
+
+
+def resume_clock(seconds: int, now: float | None = None) -> str:
+    """Local clock when the wait ends, for the user-facing notice."""
+    moment = time.time() if now is None else now
+    clear_at = moment + max(0, int(seconds))
+    when = datetime.fromtimestamp(clear_at)
+    if datetime.fromtimestamp(moment).date() == when.date():
+        return when.strftime("%H:%M")
+    return when.strftime("%m-%d %H:%M")

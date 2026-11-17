@@ -23,7 +23,7 @@ from .announce import Audience, announce_body, private_sender_id
 from .delivery_store import AnnounceLedger, ForwardStore
 from .flood_gate import EDIT as FLOOD_EDIT
 from .flood_gate import MEDIA as FLOOD_MEDIA
-from .flood_gate import FloodGate, describe_wait
+from .flood_gate import FloodGate, describe_wait, resume_clock
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
 from .settings import Settings
@@ -1593,6 +1593,7 @@ def format_forward_notice(label: str, user_id: int | None, count: int) -> str:
 
 
 _pending_forward: dict[int, dict] = {}
+_flood_notice_until: dict[int, float] = {}
 _forward_store: ForwardStore | None = None
 _announce_ledger: AnnounceLedger | None = None
 _spool_root: Path | None = None
@@ -2549,12 +2550,36 @@ async def _send_flood_notice(
     wait: int,
     is_admin: bool,
 ) -> None:
-    """Do not send while the send gate is closed. Another send would extend the ban."""
-    del client, message, is_admin
+    """Tell this chat once when sends resume. A refused notice is not retried."""
+    del is_admin
+    chat_id = getattr(message, "chat_id", None)
+    clear_at = time.time() + max(0, int(wait))
+    if chat_id is not None and _flood_notice_until.get(int(chat_id), 0) >= clear_at - 60:
+        logging.warning(
+            "Declined a generation; notice already sent, still blocking for %s",
+            describe_wait(wait),
+        )
+        return
     logging.warning(
         "Declined a generation; Telegram still blocking sends for %s",
         describe_wait(wait),
     )
+    if chat_id is None:
+        return
+    text = (
+        f"Telegram 正在限制发送，预计 {resume_clock(wait)} 恢复。"
+        "这段时间发视频不会开始生成，也不扣次数。到点后再发一次就行。"
+    )
+    try:
+        await client.send_message(chat_id, text, reply_to=getattr(message, "id", None))
+    except FloodWaitError as exc:
+        _flood.note_error(exc, FLOOD_MEDIA)
+        logging.warning("Flood notice was refused; not retrying")
+        return
+    except Exception:
+        logging.exception("flood notice failed")
+        return
+    _flood_notice_until[int(chat_id)] = clear_at
 
 
 class ProgressReporter:
