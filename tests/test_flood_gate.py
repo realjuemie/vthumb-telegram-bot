@@ -54,7 +54,10 @@ class FloodGateTests(unittest.TestCase):
             self.assertGreater(second.remaining(MEDIA), 850)
             self.assertEqual(second.remaining(EDIT), 0)
 
-    def test_expired_deadline_reads_as_clear(self) -> None:
+    def test_a_fraction_of_a_second_still_blocks(self) -> None:
+        gate = FloodGate()
+        gate._until[MEDIA] = time.time() + 0.2
+        self.assertEqual(gate.remaining(MEDIA), 1)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "flood.json"
             path.write_text('{"media": %f, "edit": 0}' % (time.time() - 5))

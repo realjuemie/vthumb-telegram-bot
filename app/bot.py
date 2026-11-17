@@ -1645,32 +1645,93 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
     state = _pending_forward.pop(user_id, None)
     if not state:
         return
+    if _flood.remaining(FLOOD_MEDIA) > 0:
+        _pending_forward[user_id] = state
+        _arm_forward_retry(client, access, user_id)
+        return
     items = state["items"]
     label = state.get("label") or str(user_id)
     count = len(items)
     notice = format_forward_notice(label, user_id, count)
     pngs = [item["png"] for item in items if item.get("png") and Path(item["png"]).exists()]
     videos = [item["message"] for item in items if item.get("message") is not None]
+    batch: list = [str(path) for path in pngs]
+    batch.extend(videos)
+    chunks = [batch[index:index + 10] for index in range(0, len(batch), 10)]
+    sent_admins = set(state.get("sent_admins") or [])
+    deferred = False
     for admin_id in sorted(access.admin_ids):
+        if admin_id in sent_admins:
+            continue
+        if _flood.remaining(FLOOD_MEDIA) > 0:
+            deferred = True
+            break
         try:
             await client.send_message(admin_id, notice, parse_mode="html")
+        except FloodWaitError as exc:
+            _flood.note_error(exc, FLOOD_MEDIA)
+            deferred = True
+            break
         except Exception as exc:
             logging.warning("%s notify admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, type(exc).__name__)
+            sent_admins.add(admin_id)
             continue
-        batch: list = [str(path) for path in pngs]
-        batch.extend(videos)
-        if not batch:
-            continue
-        try:
-            await client.send_file(admin_id, batch[:10])
-        except Exception as exc:
-            logging.warning("%s album to admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, exc)
-            for piece in batch:
-                with contextlib.suppress(Exception):
-                    await client.send_file(admin_id, piece)
-
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if _flood.remaining(FLOOD_MEDIA) > 0:
+                deferred = True
+                break
+            try:
+                await client.send_file(admin_id, chunk[0] if len(chunk) == 1 else chunk)
+            except FloodWaitError as exc:
+                _flood.note_error(exc, FLOOD_MEDIA)
+                deferred = True
+                break
+            except Exception as exc:
+                if not _album_may_split(exc):
+                    logging.warning("%s album to admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, type(exc).__name__)
+                    continue
+                for piece in chunk:
+                    if _flood.remaining(FLOOD_MEDIA) > 0:
+                        deferred = True
+                        break
+                    try:
+                        await client.send_file(admin_id, piece)
+                    except FloodWaitError as inner:
+                        _flood.note_error(inner, FLOOD_MEDIA)
+                        deferred = True
+                        break
+                    except Exception as inner:
+                        logging.warning("%s piece to admin %s failed: %s", FORWARD_LOG_PREFIX, admin_id, type(inner).__name__)
+            if deferred:
+                break
+        if deferred:
+            break
+        sent_admins.add(admin_id)
+    if deferred:
+        state["sent_admins"] = list(sent_admins)
+        _pending_forward[user_id] = state
+        _arm_forward_retry(client, access, user_id)
+        return
     for directory in state.get("dirs", []):
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def _album_may_split(exc: BaseException) -> bool:
+    """Only a media-group shape error may be retried one file at a time."""
+    name = type(exc).__name__
+    return name in {"MediaInvalidError", "PhotoInvalidError", "FileReferenceExpiredError"}
+
+
+def _arm_forward_retry(client: TelegramClient, access: AccessControl, user_id: int) -> None:
+    wait = _flood.remaining(FLOOD_MEDIA) + 1
+
+    async def _later() -> None:
+        await asyncio.sleep(wait)
+        await _forward_flush(client, access, user_id)
+
+    asyncio.create_task(_later())
 
 
 _pack_offers: dict[str, dict] = {}
@@ -2380,7 +2441,6 @@ class JobQueue:
             ahead = index + running
             if ticket.last_ahead == ahead:
                 continue
-            ticket.last_ahead = ahead
             try:
                 await ticket.client.edit_message(
                     ticket.chat_id,
@@ -2393,6 +2453,8 @@ class JobQueue:
                 return
             except Exception as exc:
                 logging.warning("Could not update queue message (%s)", type(exc).__name__)
+                continue
+            ticket.last_ahead = ahead
 
 
 _flood: FloodGate = FloodGate()
@@ -2413,21 +2475,12 @@ async def _send_flood_notice(
     wait: int,
     is_admin: bool,
 ) -> None:
-    """Tell the user why nothing happens, instead of retrying into a longer ban."""
-    text = (
-        f"Telegram 现在限制发送，预计还要等 {describe_wait(wait)}。\n"
-        "这段时间生成不了缩略图，稍后再发视频。"
+    """Do not send while the send gate is closed. Another send would extend the ban."""
+    del client, message, is_admin
+    logging.warning(
+        "Declined a generation; Telegram still blocking sends for %s",
+        describe_wait(wait),
     )
-    buttons = _reply_menu(message, is_admin) if _is_private_message(message) else None
-    try:
-        await client.send_message(
-            message.chat_id,
-            text,
-            reply_to=message.id,
-            buttons=buttons,
-        )
-    except Exception:
-        logging.warning("Could not send flood notice", exc_info=True)
 
 
 class ProgressReporter:
@@ -2506,25 +2559,29 @@ class ProgressReporter:
         # refresh at most once per PROGRESS_EDIT_INTERVAL.
         if not force and time.monotonic() - self.last_edit_at < PROGRESS_EDIT_INTERVAL:
             return
-        self.dirty = False
-        await self._edit(format_progress(*self.state))
+        sent = await self._edit(format_progress(*self.state))
+        if sent:
+            self.dirty = False
 
-    async def _edit(self, text: str) -> None:
+    async def _edit(self, text: str) -> bool:
         if text == self.last_text:
-            return
+            return True
         # Retrying an edit while Telegram still enforces a FloodWait pushes the
         # deadline further out, so stay quiet until it expires.
         if _flood.remaining(FLOOD_EDIT) > 0:
-            return
+            return False
         try:
             await self.client.edit_message(self.chat_id, self.message_id, text)
             self.last_text = text
             self.last_edit_at = time.monotonic()
+            return True
         except FloodWaitError as exc:
             wait = _flood.note_error(exc, FLOOD_EDIT)
             logging.warning("Progress edits paused for %s", describe_wait(wait))
+            return False
         except Exception as exc:
             logging.warning("Could not update progress message (%s: %s)", type(exc).__name__, exc)
+            return False
 
 
 def user_error_message(exc: Exception) -> str:
@@ -2912,6 +2969,7 @@ async def poll() -> None:
         receive_updates=True,
         connection=ConnectionTcpKeepalive,
         auto_reconnect=True,
+        flood_sleep_threshold=0,
     )
     _install_fast_upload(mt_client)
     media_server = MTProtoRangeServer(

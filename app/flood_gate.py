@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -49,15 +51,24 @@ class FloodGate:
     def _save(self) -> None:
         if self.path is None:
             return
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         try:
-            self.path.write_text(json.dumps(self._until))
+            tmp.write_text(json.dumps(self._until))
+            os.replace(tmp, self.path)
         except Exception:
             logging.warning("Could not persist flood state", exc_info=True)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def remaining(self, bucket: str = MEDIA) -> int:
-        """Seconds still to wait for this bucket. 0 means not blocked."""
+        """Seconds still to wait. A fraction of a second still counts as blocked."""
         with self._lock:
-            return max(0, int(self._until.get(bucket, 0.0) - time.time()))
+            left = self._until.get(bucket, 0.0) - time.time()
+        if left <= 0:
+            return 0
+        return math.ceil(left)
 
     def note(self, bucket: str, seconds: float | int | None) -> int:
         """Record a FloodWait of `seconds`; never shortens an existing wait."""
@@ -72,7 +83,7 @@ class FloodGate:
             if deadline > self._until.get(bucket, 0.0):
                 self._until[bucket] = deadline
                 self._save()
-            return max(0, int(self._until[bucket] - time.time()))
+            return max(0, math.ceil(self._until[bucket] - time.time()))
 
     def note_error(self, exc: BaseException, bucket: str = MEDIA) -> int:
         return self.note(bucket, getattr(exc, "seconds", 0))
