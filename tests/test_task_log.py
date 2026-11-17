@@ -76,8 +76,9 @@ class TaskLogTests(unittest.TestCase):
                 image_message_id=7,
                 content_key="clip.mp4|1000|12",
             )
-            found = log.lookup("999", "clip.mp4|1000|12")
+            found = log.lookup("111")
             self.assertEqual(found["image_message_id"], 7)
+            self.assertIsNone(log.lookup("999", "clip.mp4|1000|12"))
             self.assertEqual(found["source_chat_id"], 5)
 
     def test_grant_ignores_open_access(self) -> None:

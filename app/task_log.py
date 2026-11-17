@@ -74,14 +74,16 @@ class TaskLog:
         temporary.replace(self.path)
 
     def lookup(self, key: str | None, alias: str | None = None) -> dict | None:
-        for candidate in (key, alias):
-            if not candidate:
-                continue
-            record = self.files.get(candidate)
-            if not isinstance(record, dict):
-                continue
-            if record.get("image_message_id") and record.get("source_message_id"):
-                return record
+        # `alias` is filename|size|duration. Different videos can share that,
+        # so it must not select a saved sheet. Callers still pass it.
+        del alias
+        if not key:
+            return None
+        record = self.files.get(key)
+        if not isinstance(record, dict):
+            return None
+        if record.get("image_message_id") and record.get("source_message_id"):
+            return record
         return None
 
     def remember(
@@ -102,8 +104,7 @@ class TaskLog:
             "saved_at": datetime.now(TZ).isoformat(timespec="seconds"),
         }
         self.files[key] = record
-        if content_key and content_key != key:
-            self.files[content_key] = record
+        # Do not also index by filename|size|duration. That alias is not a fingerprint.
         self._save()
 
     def known_user_ids(self) -> set[int]:

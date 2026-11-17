@@ -20,6 +20,7 @@ from telethon.sessions import SQLiteSession
 from .access_control import AccessControl, GroupAccess
 from .adsgram import consume_claims, fetch_ad, numeric_block_id
 from .announce import Audience, announce_body, private_sender_id
+from .delivery_store import AnnounceLedger, ForwardStore
 from .flood_gate import EDIT as FLOOD_EDIT
 from .flood_gate import MEDIA as FLOOD_MEDIA
 from .flood_gate import FloodGate, describe_wait
@@ -683,6 +684,8 @@ async def _publish_announce(
         try:
             await client.send_message(user_id, text, parse_mode="md", link_preview=False)
             sent += 1
+            if _announce_ledger is not None:
+                _announce_ledger.mark(text, user_id)
         except FloodWaitError as exc:
             wait = _flood.note_error(exc, FLOOD_MEDIA)
             logging.warning(
@@ -1590,6 +1593,14 @@ def format_forward_notice(label: str, user_id: int | None, count: int) -> str:
 
 
 _pending_forward: dict[int, dict] = {}
+_forward_store: ForwardStore | None = None
+_announce_ledger: AnnounceLedger | None = None
+_spool_root: Path | None = None
+
+
+def _persist_forwards() -> None:
+    if _forward_store is not None:
+        _forward_store.save(_pending_forward)
 
 
 async def _forward_note_success(
@@ -1606,7 +1617,8 @@ async def _forward_note_success(
     actor_id = requester_id if requester_id is not None else getattr(message, "sender_id", None)
     if actor_id is None or access.is_admin(actor_id):
         return
-    keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_fwd_"))
+    keep_dir = (_spool_root or Path(tempfile.gettempdir())) / f"fwd-{actor_id}-{secrets.token_hex(4)}"
+    keep_dir.mkdir(parents=True, exist_ok=True)
     kept: Path | None = None
     try:
         dest = keep_dir / png_path.name
@@ -1615,7 +1627,8 @@ async def _forward_note_success(
     except OSError as exc:
         logging.warning("%s copy sheet failed: %s", FORWARD_LOG_PREFIX, exc)
         shutil.rmtree(keep_dir, ignore_errors=True)
-        keep_dir = Path(tempfile.mkdtemp(prefix="vthumb_fwd_"))
+        keep_dir = (_spool_root or Path(tempfile.gettempdir())) / f"fwd-{actor_id}-{secrets.token_hex(4)}"
+        keep_dir.mkdir(parents=True, exist_ok=True)
     sender = None
     with contextlib.suppress(Exception):
         sender = await message.get_sender()
@@ -1625,7 +1638,12 @@ async def _forward_note_success(
         {"items": [], "dirs": [], "label": label, "task": None},
     )
     state["label"] = label
-    state["items"].append({"message": message, "png": kept})
+    state["items"].append({
+        "message": message,
+        "png": str(kept) if kept is not None else None,
+        "source_chat_id": getattr(message, "chat_id", None),
+        "source_message_id": getattr(message, "id", None),
+    })
     if keep_dir not in state["dirs"]:
         state["dirs"].append(keep_dir)
     logging.info("%s queued for admin uid=%s", FORWARD_LOG_PREFIX, actor_id)
@@ -1647,6 +1665,7 @@ async def _forward_note_success(
             logging.exception("%s debounce fire failed", FORWARD_LOG_PREFIX)
 
     state["task"] = asyncio.create_task(_wait())
+    _persist_forwards()
 
 
 async def _forward_flush(client: TelegramClient, access: AccessControl, user_id: int) -> None:
@@ -1655,6 +1674,7 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
         return
     if _flood.remaining(FLOOD_MEDIA) > 0:
         _pending_forward[user_id] = state
+        _persist_forwards()
         _arm_forward_retry(client, access, user_id)
         return
     items = state["items"]
@@ -1662,7 +1682,13 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
     count = len(items)
     notice = format_forward_notice(label, user_id, count)
     pngs = [item["png"] for item in items if item.get("png") and Path(item["png"]).exists()]
-    videos = [item["message"] for item in items if item.get("message") is not None]
+    videos = []
+    for item in items:
+        message = item.get("message")
+        if message is None and item.get("source_chat_id") and item.get("source_message_id"):
+            message = await _saved_message(client, int(item["source_chat_id"]), int(item["source_message_id"]))
+        if message is not None:
+            videos.append(message)
     batch: list = [str(path) for path in pngs]
     batch.extend(videos)
     chunks = [batch[index:index + 10] for index in range(0, len(batch), 10)]
@@ -1720,10 +1746,16 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
     if deferred:
         state["sent_admins"] = list(sent_admins)
         _pending_forward[user_id] = state
+        _persist_forwards()
         _arm_forward_retry(client, access, user_id)
         return
+    for item in items:
+        png = item.get("png")
+        if png:
+            Path(png).unlink(missing_ok=True)
     for directory in state.get("dirs", []):
         shutil.rmtree(directory, ignore_errors=True)
+    _persist_forwards()
 
 
 def _album_may_split(exc: BaseException) -> bool:
@@ -1819,6 +1851,9 @@ async def _send_pack_album(
             try:
                 await client.send_file(chat_id, album, force_document=False)
                 return True
+            except FloodWaitError as exc:
+                _flood.note_error(exc, FLOOD_MEDIA)
+                return False
             except Exception as exc:
                 logging.warning("pack-forward reuse failed: %s", exc)
         return False
@@ -1833,6 +1868,9 @@ async def _send_pack_album(
             progress_callback=_on_upload,
         )
         return True
+    except FloodWaitError as exc:
+        _flood.note_error(exc, FLOOD_MEDIA)
+        return False
     except Exception as exc:
         logging.warning("pack-forward file album failed: %s", exc)
         return False
@@ -3023,6 +3061,15 @@ async def poll() -> None:
     _audience = Audience(Path(settings.access_file).with_name("audience.json"))
     global _flood
     _flood = FloodGate(Path(settings.access_file).with_name("flood.json"))
+    global _forward_store, _announce_ledger, _spool_root
+    data_dir = Path(settings.access_file).parent
+    _spool_root = data_dir / "admin_spool"
+    _spool_root.mkdir(parents=True, exist_ok=True)
+    _forward_store = ForwardStore(data_dir / "forward_outbox.json")
+    _announce_ledger = AnnounceLedger(data_dir / "announce_ledger.json")
+    for pending_user, pending_state in _forward_store.load().items():
+        _pending_forward[pending_user] = pending_state
+        _arm_forward_retry(mt_client, access, pending_user)
     flood_left = _flood.remaining(FLOOD_MEDIA)
     if flood_left:
         logging.warning(
@@ -3262,6 +3309,7 @@ async def poll() -> None:
             user_id
             for user_id in (_audience.ids() if _audience is not None else [])
             if user_id != publisher
+            and user_id not in (_announce_ledger.already_sent(text) if _announce_ledger is not None else set())
         ]
         await event.answer("开始发布")
         with contextlib.suppress(Exception):
