@@ -45,6 +45,17 @@ class ByteRangeTests(unittest.TestCase):
         self.assertLess(capped_end, end)
         self.assertTrue(partial)
 
+    def test_a_large_front_header_is_not_cut_at_eight_megabytes(self) -> None:
+        from app.mtproto_range import HEADER_READ_CAP, OPEN_ENDED_CAP, cap_open_ended
+
+        start, end, _partial = parse_byte_range("bytes=0-", 800_000_000)
+        header_end = 18_350_080
+        _capped_start, capped_end, capped = cap_open_ended("bytes=0-", start, end, header_end)
+        self.assertTrue(capped)
+        self.assertEqual(capped_end - start + 1, header_end)
+        self.assertGreater(capped_end - start + 1, OPEN_ENDED_CAP)
+        self.assertLessEqual(capped_end - start + 1, HEADER_READ_CAP)
+
 
 class ChunkCacheTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_media_registration(self) -> None:

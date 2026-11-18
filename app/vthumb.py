@@ -320,7 +320,9 @@ def get_media_info(url: str, timeout: int) -> MediaInfo:
             "-analyzeduration",
             "0",
             "-probesize",
-            "5000000",
+            # A 4-hour compilation can keep a 10–20MB moov at the front.
+            # 5MB stops inside that atom and ffprobe reports End of file.
+            "50331648",
             "-print_format",
             "json",
             "-show_format",

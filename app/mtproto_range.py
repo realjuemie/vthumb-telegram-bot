@@ -44,6 +44,8 @@ class MediaRegistration:
     cache_dir: Path | None = None
     layout: FaststartLayout | None = None
     layout_checked: bool = False
+    # Bytes of header a reader must see before the media body. 0 means unknown.
+    header_end: int = 0
 
     def __post_init__(self) -> None:
         if self.hard_budget is None:
@@ -82,10 +84,20 @@ def parse_byte_range(value: str | None, size: int) -> tuple[int, int, bool]:
 
 
 OPEN_ENDED_CAP = 8 * 1024 * 1024
+HEADER_READ_CAP = 48 * 1024 * 1024
 
 
-def cap_open_ended(value: str | None, start: int, end: int) -> tuple[int, int, bool]:
-    """Don't stream a whole file when the client leaves the range end open."""
+def cap_open_ended(
+    value: str | None,
+    start: int,
+    end: int,
+    header_end: int = 0,
+) -> tuple[int, int, bool]:
+    """Don't stream a whole file when the client leaves the range end open.
+
+    A front moov larger than the default cap must still be delivered whole.
+    Cutting it produces ffprobe's "error reading header" / "End of file".
+    """
     if not value or not value.startswith("bytes=") or "," in value:
         return start, end, False
     spec = value[6:].strip()
@@ -94,9 +106,12 @@ def cap_open_ended(value: str | None, start: int, end: int) -> tuple[int, int, b
     start_text, end_text = spec.split("-", 1)
     if not start_text or end_text:
         return start, end, False
-    if end - start + 1 <= OPEN_ENDED_CAP:
+    limit = OPEN_ENDED_CAP
+    if start == 0 and header_end > limit:
+        limit = min(header_end, HEADER_READ_CAP)
+    if end - start + 1 <= limit:
         return start, end, True
-    return start, start + OPEN_ENDED_CAP - 1, True
+    return start, start + limit - 1, True
 
 
 class MTProtoRangeServer:
@@ -198,11 +213,26 @@ class MTProtoRangeServer:
         try:
             range_header = request.headers.get("Range")
             start, end, partial = parse_byte_range(range_header, registration.size)
-            capped_start, capped_end, capped = cap_open_ended(range_header, start, end)
-            if capped and capped_end != end:
-                start, end, partial = capped_start, capped_end, True
         except InvalidRange:
             return web.Response(status=416, headers={"Content-Range": f"bytes */{registration.size}"})
+
+        try:
+            layout = await self._ensure_layout(key, registration)
+        except FetchBudgetExceeded as exc:
+            registration.failure = exc
+            raise
+        header_end = registration.header_end
+        if layout is not None:
+            header_end = max(header_end, layout.prefix_end + layout.moov_size)
+        capped_start, capped_end, capped = cap_open_ended(range_header, start, end, header_end)
+        if capped and capped_end != end:
+            if capped_end - capped_start + 1 > OPEN_ENDED_CAP:
+                logging.info(
+                    "Extended open-ended read to %d bytes so the MP4 header fits file=%r",
+                    capped_end - capped_start + 1,
+                    registration.filename,
+                )
+            start, end, partial = capped_start, capped_end, True
 
         headers = {
             "Accept-Ranges": "bytes",
@@ -217,7 +247,6 @@ class MTProtoRangeServer:
             return response
 
         try:
-            layout = await self._ensure_layout(key, registration)
             if layout is None:
                 await self._write_span(response, key, registration, start, end - start + 1)
             else:
@@ -287,11 +316,18 @@ class MTProtoRangeServer:
                 if moov is not None or window >= file_size:
                     break
                 window = min(file_size, window * 4)
+        if moov is not None and mdat is not None and moov.offset < mdat.offset:
+            registration.header_end = min(mdat.offset, HEADER_READ_CAP)
+        elif moov is not None:
+            registration.header_end = min(moov.offset + moov.size, HEADER_READ_CAP)
         if moov is None or mdat is None or moov.offset < mdat.offset:
             return None
-        if moov.size > 48 * 1024 * 1024:
+        if moov.size > HEADER_READ_CAP:
             return None
-        return layout_from_moov(file_size, mdat, moov, await read(moov.offset, moov.size))
+        layout = layout_from_moov(file_size, mdat, moov, await read(moov.offset, moov.size))
+        if layout is not None:
+            registration.header_end = min(layout.prefix_end + layout.moov_size, HEADER_READ_CAP)
+        return layout
 
     async def _read_span(self, key: str, registration: MediaRegistration, offset: int, length: int) -> bytes:
         if length <= 0:
