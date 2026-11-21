@@ -60,6 +60,10 @@ class BotCommandTests(unittest.TestCase):
 
     def test_reply_menu_maps_labels_and_hides_admin_rows(self) -> None:
         self.assertEqual(menu_action("  使用说明  "), "/help")
+        self.assertEqual(menu_action("Help"), "/help")
+        self.assertEqual(menu_action("Settings"), "/setting")
+        self.assertEqual(menu_action("Cancel merge"), "/merge cancel")
+        self.assertEqual(menu_action("Add credits"), "/bonus")
         self.assertEqual(menu_action("取消合并"), "/merge cancel")
         self.assertEqual(menu_action("发布公告"), "/announce")
         self.assertIsNone(menu_action("/help"))

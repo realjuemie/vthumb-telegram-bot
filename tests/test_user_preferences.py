@@ -56,6 +56,22 @@ class UserPreferencesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preferences.get(100).count, 20)
             self.assertEqual(preferences.get_delivery(100), "media")
 
+    async def test_missing_lang_stays_chinese_and_existing_user_is_not_prompted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preferences.json"
+            path.write_text(
+                '{"preferences":{"100":{"count":20,"cols":5}}}',
+                encoding="utf-8",
+            )
+            preferences = UserPreferences(path)
+            self.assertEqual(preferences.get_lang(100), "zh")
+            self.assertTrue(preferences.has_chosen_lang(100))
+            self.assertFalse(preferences.has_chosen_lang(999))
+            await preferences.set_lang(999, "en")
+            reloaded = UserPreferences(path)
+            self.assertEqual(reloaded.get_lang(999), "en")
+            self.assertEqual(reloaded.get_lang(100), "zh")
+
     async def test_unsupported_delivery_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             preferences = UserPreferences(Path(directory) / "preferences.json")

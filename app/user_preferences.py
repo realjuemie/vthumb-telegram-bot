@@ -5,6 +5,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .i18n import DEFAULT_LANG, LANGS, normalize_lang
+
 
 @dataclass(frozen=True)
 class ThumbnailPreset:
@@ -57,28 +59,35 @@ DEFAULT_THEME = THEME_POTPLAYER
 class UserPreferences:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.values, self.delivery_modes, self.theme_modes = self._load()
+        self.values, self.delivery_modes, self.theme_modes, self.languages = self._load()
         self.lock = asyncio.Lock()
 
-    def _load(self) -> tuple[dict[int, ThumbnailPreset], dict[int, str], dict[int, str]]:
+    def _load(self) -> tuple[dict[int, ThumbnailPreset], dict[int, str], dict[int, str], dict[int, str]]:
         if not self.path.exists():
-            return {}, {}, {}
+            return {}, {}, {}, {}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             values: dict[int, ThumbnailPreset] = {}
             delivery_modes: dict[int, str] = {}
             theme_modes: dict[int, str] = {}
+            languages: dict[int, str] = {}
             for user_id, item in payload.get("preferences", {}).items():
+                uid = int(user_id)
                 preset = PRESETS_BY_KEY.get((int(item["count"]), int(item["cols"])))
                 if preset:
-                    values[int(user_id)] = preset
+                    values[uid] = preset
                 delivery = item.get("delivery", DEFAULT_DELIVERY)
                 if delivery in DELIVERY_MODES:
-                    delivery_modes[int(user_id)] = delivery
+                    delivery_modes[uid] = delivery
                 theme = item.get("theme", DEFAULT_THEME)
                 if theme in THEMES:
-                    theme_modes[int(user_id)] = theme
-            return values, delivery_modes, theme_modes
+                    theme_modes[uid] = theme
+                raw_lang = item.get("lang")
+                if isinstance(raw_lang, str) and raw_lang.strip():
+                    code = raw_lang.strip().lower().replace("_", "-")
+                    if code in LANGS or code.startswith("en") or code.startswith("zh"):
+                        languages[uid] = normalize_lang(code)
+            return values, delivery_modes, theme_modes, languages
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise RuntimeError(f"Cannot read user preferences: {self.path}") from exc
 
@@ -97,8 +106,21 @@ class UserPreferences:
             return DEFAULT_THEME
         return self.theme_modes.get(user_id, DEFAULT_THEME)
 
+    def get_lang(self, user_id: int | None) -> str:
+        if user_id is None:
+            return DEFAULT_LANG
+        return self.languages.get(user_id, DEFAULT_LANG)
+
+    def has_chosen_lang(self, user_id: int | None) -> bool:
+        """Existing records count as Chinese already chosen. A blank user has not."""
+        if user_id is None:
+            return False
+        if user_id in self.languages:
+            return True
+        return user_id in self.values or user_id in self.delivery_modes or user_id in self.theme_modes
+
     def known_user_ids(self) -> set[int]:
-        return set(self.values) | set(self.delivery_modes) | set(self.theme_modes)
+        return set(self.values) | set(self.delivery_modes) | set(self.theme_modes) | set(self.languages)
 
     async def set(self, user_id: int, count: int, cols: int) -> ThumbnailPreset:
         preset = PRESETS_BY_KEY.get((count, cols))
@@ -125,9 +147,35 @@ class UserPreferences:
             self._save()
         return theme
 
+    async def set_lang(self, user_id: int, lang: str) -> str:
+        chosen = normalize_lang(lang)
+        if chosen not in LANGS:
+            raise ValueError("Unsupported language.")
+        async with self.lock:
+            self.languages[user_id] = chosen
+            self._save()
+        return chosen
+
+    async def adopt_existing(self, user_ids) -> int:
+        """Mark people who already used the bot as Chinese, so they are not prompted."""
+        added = 0
+        async with self.lock:
+            for user_id in user_ids:
+                try:
+                    uid = int(user_id)
+                except (TypeError, ValueError):
+                    continue
+                if uid <= 0 or self.has_chosen_lang(uid):
+                    continue
+                self.languages[uid] = DEFAULT_LANG
+                added += 1
+            if added:
+                self._save()
+        return added
+
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        user_ids = sorted(set(self.values) | set(self.delivery_modes) | set(self.theme_modes))
+        user_ids = sorted(set(self.values) | set(self.delivery_modes) | set(self.theme_modes) | set(self.languages))
         payload = {"preferences": {}}
         for user_id in user_ids:
             preset = self.get(user_id)
@@ -136,6 +184,7 @@ class UserPreferences:
                 "cols": preset.cols,
                 "delivery": self.get_delivery(user_id),
                 "theme": self.get_theme(user_id),
+                "lang": self.get_lang(user_id),
             }
         # Atomically write via a tempfile *owned by the current user*.
         # `self.path.with_suffix('.tmp')` would not work when the bind-

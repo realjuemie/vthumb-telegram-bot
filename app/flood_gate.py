@@ -90,17 +90,11 @@ class FloodGate:
         return self.note(bucket, getattr(exc, "seconds", 0))
 
 
-def describe_wait(seconds: int) -> str:
+def describe_wait(seconds: int, lang: str = "zh") -> str:
     """`45 分钟` / `1 小时 20 分钟`, for messages to the user."""
-    if seconds <= 0:
-        return "稍后"
-    minutes = (int(seconds) + 59) // 60
-    if minutes < 60:
-        return f"{minutes} 分钟"
-    hours, rest = divmod(minutes, 60)
-    if rest:
-        return f"{hours} 小时 {rest} 分钟"
-    return f"{hours} 小时"
+    from .i18n import format_wait
+
+    return format_wait(seconds, lang)
 
 
 def resume_clock(seconds: int, now: float | None = None) -> str:

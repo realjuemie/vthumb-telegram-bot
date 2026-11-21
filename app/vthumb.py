@@ -11,9 +11,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
-logger = logging.getLogger(__name__)
+from .i18n import DEFAULT_LANG, t
 
 from PIL import Image, ImageDraw, ImageFont
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -480,6 +482,7 @@ def create_contact_sheet(
     timeout: int,
     theme: Theme = THEME_POTPLAYER,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    lang: str = DEFAULT_LANG,
 ) -> Path:
     if progress_callback:
         progress_callback("metadata", 0, 1)
@@ -543,7 +546,7 @@ def create_contact_sheet(
 
         if progress_callback:
             progress_callback("compose", 0, 1)
-        compose_contact_sheet(source, output_file, frames, times, meta, width, cols, theme)
+        compose_contact_sheet(source, output_file, frames, times, meta, width, cols, theme, lang=lang)
         if progress_callback:
             progress_callback("compose", 1, 1)
         return output_file
@@ -560,6 +563,7 @@ def compose_contact_sheet(
     sheet_width: int,
     cols: int,
     theme: Theme = THEME_POTPLAYER,
+    lang: str = DEFAULT_LANG,
 ) -> None:
     margin = 10
     gap = 8
@@ -615,7 +619,7 @@ def compose_contact_sheet(
         )
         lines = []  # rich-mode lines aren't drawn in minimal mode
     else:
-        lines = build_header_lines(source, meta, max_header_chars)
+        lines = build_header_lines(source, meta, max_header_chars, lang=lang)
         header_height = int(line_height * len(lines) + 18)
 
     # Footer band height (used by the metadata band at the bottom):
@@ -945,13 +949,14 @@ def _wrap_filename_to_width(
 
 
 
-def build_header_lines(source: SourceInfo, meta: MediaInfo, max_chars: int) -> list[str]:
+def build_header_lines(source: SourceInfo, meta: MediaInfo, max_chars: int, lang: str = DEFAULT_LANG) -> list[str]:
     # Build the multi-line header for rich-mode themes (potplayer /
     # black_bg / white_bg). Uses _wrap_filename_to_width for the
     # filename split so we get pixel-accurate, balanced wrap with
     # extension preservation -- not the brittle char-counting split
     # that produced the .m / p4 orphan.
-    prefix = "文件名: "
+    # The filename itself is not translated. Only the fixed labels are.
+    prefix = t(lang, "sheet.filename") + ": "
     name = source.filename or ""
     sheet_width = 1920
     header_font_size = max(18, round(sheet_width / 52))
@@ -969,10 +974,10 @@ def build_header_lines(source: SourceInfo, meta: MediaInfo, max_chars: int) -> l
             file_lines.append(cont)
 
     return file_lines + [
-        f"大小: {format_size(source.size)}",
-        f"分辨率: {meta.width}x{meta.height}({meta.fps} fps)",
-        f"视频解码器: {meta.video_codec} 音频解码器: {meta.audio_codec}",
-        f"时长: {format_time(meta.duration)}",
+        f"{t(lang, 'sheet.size')}: {format_size(source.size)}",
+        f"{t(lang, 'sheet.resolution')}: {meta.width}x{meta.height}({meta.fps} fps)",
+        f"{t(lang, 'sheet.video')}: {meta.video_codec}  {t(lang, 'sheet.audio')}: {meta.audio_codec}",
+        f"{t(lang, 'sheet.duration')}: {format_time(meta.duration)}",
     ]
 
 

@@ -38,6 +38,22 @@ from .user_preferences import (
     ThumbnailPreset,
     UserPreferences,
 )
+from .i18n import (
+    DEFAULT_LANG,
+    LANG_EN,
+    LANG_LABELS,
+    LANG_ZH,
+    command_pairs,
+    delivery_label as delivery_label_for,
+    language_buttons,
+    menu_actions,
+    menu_label,
+    menu_rows as localized_menu_rows,
+    normalize_lang,
+    preset_label,
+    t,
+    theme_label,
+)
 from .vthumb import (
     THEME_BY_NAME,
     SourceInfo,
@@ -77,55 +93,13 @@ def _install_fast_upload(client: TelegramClient) -> None:
 
     client.upload_file = upload_file  # type: ignore[method-assign]
 
-USER_COMMANDS = (
-    ("start", "开始使用并查看视频发送方式"),
-    ("help", "查看使用说明"),
-    ("status", "查看缩略图设置和读取预算"),
-    ("setting", "选择每个用户独立的缩略图预设"),
-    ("id", "查看自己的 Telegram 用户 ID"),
-    ("info", "查看账号、授权状态和今日剩余次数"),
-    ("checkin", "每日签到，获得 1 到 3 次储存次数"),
-    ("ad", "看广告，获得 5 次储存次数"),
-    ("merge", "合并接下来 N 条媒体 (默认 2)，图片在前视频在后"),
-    ("thumb", "回复一条视频，生成缩略图"),
-)
-ADMIN_COMMANDS = (
-    ("add", "管理员：添加授权用户"),
-    ("del", "管理员：删除授权用户"),
-    ("users", "管理员：查看授权用户"),
-    ("guest", "管理员：开关非授权用户使用"),
-    ("bonus", "管理员：给非授权用户增加储存次数"),
-    ("announce", "管理员：预览并发布 Markdown 公告"),
-    ("group", "管理员：在群里授权该群使用缩略图"),
-)
+USER_COMMANDS = command_pairs(LANG_ZH, ads_enabled=True)
+ADMIN_COMMANDS = command_pairs(LANG_ZH, include_admin=True, ads_enabled=True)[len(USER_COMMANDS):]
 BOT_COMMANDS = USER_COMMANDS + ADMIN_COMMANDS
 
-# Bottom reply keyboard in private chats. Labels are exact message text.
-# Do not put the admin-forward toggle here — that stays on /setting only.
-# /group and /thumb stay slash-only: they only work as a reply inside a group.
-USER_MENU_ROWS = (
-    ("使用说明", "我的设置", "运行状态"),
-    ("我的信息", "每日签到", "看广告"),
-    ("合并消息", "取消合并"),
-)
-ADMIN_MENU_ROWS = (
-    ("授权名单", "发布公告"),
-    ("游客开关", "加次数"),
-)
-MENU_ACTIONS = {
-    "使用说明": "/help",
-    "我的设置": "/setting",
-    "运行状态": "/status",
-    "我的信息": "/info",
-    "每日签到": "/checkin",
-    "看广告": "/ad",
-    "合并消息": "/merge",
-    "取消合并": "/merge cancel",
-    "授权名单": "/users",
-    "发布公告": "/announce",
-    "游客开关": "/guest toggle",
-    "加次数": "/bonus",
-}
+# Bottom reply keyboard in private chats. Labels in either language map to the
+# same command, so a keyboard left over from the other language still works.
+MENU_ACTIONS = menu_actions()
 
 # ── /merge feature constants ─────────────────────────────────────────
 MERGE_DEFAULT_COUNT = 2          # bare /merge picks this many
@@ -194,33 +168,36 @@ def command_mention(text: str | None) -> str | None:
     return mention or None
 
 
-def permission_message(user_id: int | None) -> str:
-    return f"你还没有使用权限。\n你的 Telegram ID：{user_id or '未知'}\n请将此 ID 提供给管理员添加。"
+def permission_message(user_id: int | None, lang: str | None = None) -> str:
+    return t(lang, "perm.denied", user_id=user_id or t(lang, "unknown_id"))
 
 
-def quota_message(limit: int, community_url: str, ad_reward: int = 5, ads_enabled: bool = False) -> str:
-    text = (
-        f"今天的 {limit} 次生成已经用完，储存次数也没有了。\n"
-        "发送 /checkin 每天可再获得 1 到 3 次。\n"
-    )
+def quota_message(limit: int, community_url: str, ad_reward: int = 5, ads_enabled: bool = False, lang: str | None = None) -> str:
+    text = t(lang, "quota.exhausted", limit=limit)
     if ads_enabled:
-        text += f"看广告可获得 {ad_reward} 次。点开广告后再点领取。\n"
-    text += "请通过社群群聊联系开发者升级权限。"
+        text += t(lang, "quota.ad", reward=ad_reward)
+    text += t(lang, "quota.contact")
     if community_url:
         text += f"\n{community_url}"
     return text
 
 
 _audience: Audience | None = None
+_preferences: UserPreferences | None = None
 _announce_wait: set[int] = set()
 _bonus_wait: set[int] = set()
 _announce_drafts: dict[str, dict] = {}
 BONUS_MAX = 100_000
-GUEST_CLOSED_TEXT = "非授权用户暂时不能使用。签到和生成都先停一下。"
-ANNOUNCE_HINT = (
-    "请发送公告内容。支持 Markdown：\n"
-    "**粗体**、__斜体__、`代码`、[文字](链接)"
-)
+GUEST_CLOSED_TEXT = t(LANG_ZH, "guest.closed")
+ANNOUNCE_HINT = t(LANG_ZH, "announce.hint")
+# Ad reward buttons stay off until they are turned back on. /ad still exists in code.
+SHOW_AD_BUTTON = False
+
+
+def user_lang(user_id: int | None) -> str:
+    if _preferences is None or user_id is None:
+        return DEFAULT_LANG
+    return _preferences.get_lang(user_id)
 
 
 async def _show_announce_preview(client: TelegramClient, admin_id: int, chat_id: int, text: str, reply_to: int) -> None:
@@ -344,15 +321,9 @@ def _is_private_message(message: Any) -> bool:
 _ads_enabled = False
 
 
-def menu_rows(is_admin: bool, ads_enabled: bool | None = None) -> tuple[tuple[str, ...], ...]:
+def menu_rows(is_admin: bool, ads_enabled: bool | None = None, lang: str | None = None) -> tuple[tuple[str, ...], ...]:
     enabled = _ads_enabled if ads_enabled is None else ads_enabled
-    rows = USER_MENU_ROWS
-    if not enabled:
-        rows = tuple(tuple(label for label in row if label != "看广告") for row in rows)
-        rows = tuple(row for row in rows if row)
-    if is_admin:
-        return rows + ADMIN_MENU_ROWS
-    return rows
+    return localized_menu_rows(is_admin, lang, ads_enabled=enabled)
 
 
 def menu_action(text: str | None) -> str | None:
@@ -370,9 +341,9 @@ def private_menu_action(message: Any) -> str | None:
     return menu_action(getattr(message, "raw_text", None))
 
 
-def main_menu(is_admin: bool):
+def main_menu(is_admin: bool, lang: str | None = None):
     rows = []
-    for row_index, row in enumerate(menu_rows(is_admin)):
+    for row_index, row in enumerate(menu_rows(is_admin, ads_enabled=SHOW_AD_BUTTON, lang=lang)):
         buttons = []
         for col_index, label in enumerate(row):
             if row_index == 0 and col_index == 0:
@@ -383,10 +354,10 @@ def main_menu(is_admin: bool):
     return rows
 
 
-def _reply_menu(message: Any, is_admin: bool, buttons=None):
+def _reply_menu(message: Any, is_admin: bool, buttons=None, lang: str | None = None):
     if buttons is not None or not _is_private_message(message):
         return buttons
-    return main_menu(is_admin)
+    return main_menu(is_admin, lang)
 
 
 class _AsCommand:
@@ -549,6 +520,7 @@ def _html_mention(user_id: int | None, label: str | None) -> str:
 
 def _botapi_delete_sync(token: str, chat_id: int, message_id: int) -> None:
     import json
+    import urllib.error
     import urllib.request
 
     body = json.dumps({"chat_id": chat_id, "message_id": message_id}).encode()
@@ -557,8 +529,41 @@ def _botapi_delete_sync(token: str, chat_id: int, message_id: int) -> None:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=20):
-        return
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode() or "{}")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"deleteMessage HTTP {exc.code}") from None
+    if not payload.get("ok"):
+        raise RuntimeError("deleteMessage rejected")
+
+
+_bot_token = ""
+
+
+async def delete_own_message(client: TelegramClient, chat_id: int, message_id: int) -> bool:
+    """Remove a message this bot sent.
+
+    In a group, Telethon delete_messages often returns without deleting the
+    bot's own message. Bot API deleteMessage is the call that actually works.
+    """
+    if _bot_token:
+        try:
+            await asyncio.to_thread(_botapi_delete_sync, _bot_token, int(chat_id), int(message_id))
+            return True
+        except Exception as exc:
+            logging.warning(
+                "Bot API delete failed for %s/%s (%s)",
+                chat_id,
+                message_id,
+                type(exc).__name__ if not str(exc).startswith("deleteMessage") else exc,
+            )
+    try:
+        await client.delete_messages(chat_id, [int(message_id)])
+        return True
+    except Exception as exc:
+        logging.warning("Could not delete message %s/%s (%s)", chat_id, message_id, type(exc).__name__)
+        return False
 
 
 async def _handle_group_command(
@@ -597,6 +602,7 @@ async def _handle_thumb_command(
     task_log: TaskLog | None,
     message: Any,
     enqueue,
+    preferences: UserPreferences | None = None,
 ) -> None:
     if not _is_group_message(message):
         await client.send_message(message.chat_id, "请在已授权的群里回复视频，再发送 /thumb。", reply_to=message.id)
@@ -644,6 +650,7 @@ async def _handle_thumb_command(
             requester_id=message.sender_id,
             enqueue_kwargs=job_kwargs,
             mention_html=_html_mention(message.sender_id, mention_label),
+            lang=preferences.get_lang(message.sender_id) if preferences is not None else None,
         )
         return
     enqueue(replied, **job_kwargs)
@@ -714,18 +721,19 @@ def command_user_id(text: str) -> int | None:
     return user_id if user_id > 0 else None
 
 
-def delivery_label(delivery: str) -> str:
-    return "文件发送（原图）" if delivery == DELIVERY_FILE else "媒体发送（TG压缩）"
+def delivery_label(delivery: str, lang: str | None = None) -> str:
+    return delivery_label_for(delivery, lang)
 
 
-def setting_text(preset: ThumbnailPreset, delivery: str, theme: str) -> str:
+def setting_text(preset: ThumbnailPreset, delivery: str, theme: str, lang: str | None = None) -> str:
+    code = normalize_lang(lang)
     return (
-        "缩略图设置（横x竖）\n"
-        f"当前布局：{preset.label}\n"
-        f"发送方式：{delivery_label(delivery)}\n"
-        f"主题风格：{THEME_LABELS.get(theme, theme)}\n\n"
-        "提示：文件发送保留原图；媒体发送会被 Telegram 压缩。\n"
-        "点击下方按钮切换，只影响你自己的任务。"
+        t(code, "setting.title") + "\n"
+        + t(code, "setting.layout", preset=preset_label(preset.count, preset.cols, preset.rows, code)) + "\n"
+        + t(code, "setting.delivery", delivery=delivery_label(delivery, code)) + "\n"
+        + t(code, "setting.theme", theme=theme_label(theme, code)) + "\n"
+        + t(code, "setting.lang", language=LANG_LABELS[code]) + "\n\n"
+        + t(code, "setting.hint")
     )
 
 
@@ -734,43 +742,47 @@ def setting_buttons(
     delivery: str,
     theme: str,
     admin_forward: bool | None = None,
+    lang: str | None = None,
 ) -> list[list[Button]]:
+    code = normalize_lang(lang)
     buttons = []
     for preset in PRESETS:
         marker = "✓ " if preset == current else ""
         buttons.append(
             Button.inline(
-                marker + preset.label,
+                marker + preset_label(preset.count, preset.cols, preset.rows, code),
                 data=f"setting:{preset.count}:{preset.cols}".encode("ascii"),
             )
         )
     media_marker = "✓ " if delivery == DELIVERY_MEDIA else ""
     file_marker = "✓ " if delivery == DELIVERY_FILE else ""
     delivery_buttons = [
-        Button.inline(media_marker + "媒体发送（TG压缩）", data=b"delivery:media"),
-        Button.inline(file_marker + "文件发送（原图）", data=b"delivery:file"),
+        Button.inline(media_marker + delivery_label(DELIVERY_MEDIA, code), data=b"delivery:media"),
+        Button.inline(file_marker + delivery_label(DELIVERY_FILE, code), data=b"delivery:file"),
     ]
-    # Theme rows: 2 buttons per row, chunked automatically so adding a new theme
-    # (4 -> 6 themes so far) doesn't require a layout rewrite. Callbacks are
-    # `theme:<theme-name>` decoded by `theme_from_callback`.
     theme_buttons: list[Button] = []
     for theme_name in THEMES:
         marker = "✓ " if theme_name == theme else ""
         theme_buttons.append(
             Button.inline(
-                marker + THEME_LABELS[theme_name],
+                marker + theme_label(theme_name, code),
                 data=f"theme:{theme_name}".encode("ascii"),
             )
         )
     theme_rows = [theme_buttons[i : i + 2] for i in range(0, len(theme_buttons), 2)]
+    lang_buttons = [
+        Button.inline(("✓ " if code == LANG_ZH else "") + LANG_LABELS[LANG_ZH], data=b"lang:zh"),
+        Button.inline(("✓ " if code == LANG_EN else "") + LANG_LABELS[LANG_EN], data=b"lang:en"),
+    ]
     rows = [
         buttons[:2],
         buttons[2:],
         delivery_buttons,
         *theme_rows,
+        lang_buttons,
     ]
     if admin_forward is not None:
-        label = "任务转发管理员：开" if admin_forward else "任务转发管理员：关"
+        label = t(code, "fwdgate.on") if admin_forward else t(code, "fwdgate.off")
         rows.append([Button.inline(label, data=b"fwdgate:toggle")])
     return rows
 
@@ -805,6 +817,19 @@ def theme_from_callback(data: bytes) -> str | None:
     return theme
 
 
+def lang_from_callback(data: bytes) -> str | None:
+    try:
+        prefix, lang = data.decode("ascii").split(":", 1)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if prefix not in {"lang", "pick"}:
+        return None
+    code = normalize_lang(lang)
+    if lang not in {LANG_ZH, LANG_EN}:
+        return None
+    return code
+
+
 async def handle_command(
     client: TelegramClient,
     settings: Settings,
@@ -827,59 +852,73 @@ async def handle_command(
             return True
 
     user_id = message.sender_id
+    lang = preferences.get_lang(user_id)
     is_admin = access.is_admin(user_id)
     is_allowed = access.is_allowed(user_id)
     buttons = None
     if user_id is not None and command != "bonus":
         _bonus_wait.discard(user_id)
 
+    if (
+        command == "start"
+        and _is_private_message(message)
+        and user_id is not None
+        and not preferences.has_chosen_lang(user_id)
+    ):
+        await client.send_message(
+            message.chat_id,
+            t(LANG_ZH, "pick.prompt"),
+            reply_to=message.id,
+            buttons=language_buttons(),
+        )
+        return True
+
+    if command in {"start", "setting"} and _is_private_message(message) and user_id is not None:
+        await sync_user_commands(client, user_id, lang, is_admin=is_admin, ads_enabled=SHOW_AD_BUTTON)
+
     if command == "start":
         if is_allowed:
-            text = (
-                "直接发送视频，或把视频作为文件发送，我会生成缩略图。\n"
-                "不会预先完整下载大视频。\n\n"
-                "下方按钮和 /help 里的命令是一样的。"
-            )
+            text = t(lang, "start.welcome")
         else:
-            text = permission_message(user_id)
+            text = permission_message(user_id, lang)
     elif command == "help":
         if not is_allowed:
-            text = permission_message(user_id) + "\n\n使用 /id 可再次查看 ID。"
+            text = permission_message(user_id, lang) + "\n\n" + t(lang, "perm.id_again")
         else:
             text = (
-                "使用说明：\n"
-                "1. 直接发送视频，或将视频作为文件发送。\n"
-                "2. 使用 /setting 选择帧数与横竖布局。\n"
-                "3. 使用 /info 查看账号、授权状态和今日剩余次数。\n"
-                f"4. {settings.small_file_full_read_mb}MB 以内按需读取，必要时可读取完整范围。\n"
-                f"5. 大视频初始读取预算 {settings.max_source_fetch_ratio:.0%}，"
-                f"按需提升至 {settings.hard_source_fetch_ratio:.0%}，"
-                f"且不超过 {settings.max_source_fetch_mb}MB。\n"
-                "6. 已读取分块会临时缓存，任务结束后自动删除。\n"
-                "7. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n"
-                "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。\n"
-                "9. 已授权的群里，回复视频并发送 /thumb。任务和私聊共用队列。"
-            )
-            if settings.ads_live:
-                text += "\n10. 点「看广告」后，先点广告，再点领取。到账后我会告诉你。"
-            if not _is_group_message(message):
-                text += "\n\n也可以直接点下方按钮。"
-            if is_admin:
-                text += "\n\n管理员命令：\n/add 用户ID\n/del 用户ID\n/users\n/guest on|off\n/bonus 次数\n/announce 公告内容\n/group 在群里授权该群\n/thumb 回复视频生成缩略图"
-                if not _is_group_message(message):
-                    text += "\n授权名单、发布公告、游客开关、加次数也可以点下方按钮。/add、/del 需要带用户 ID。/bonus 后面跟次数，例如 /bonus 20。"
-            if not access.has_grant(user_id):
-                text += (
-                    f"\n\n未授权每天可新生成 {settings.guest_daily_limit} 次。"
-                    "使用以前的生成结果不计入次数。"
-                    " /checkin 每天可额外获得 1 到 3 次，存在储存次数里。"
+                t(lang, "help.lead")
+                + t(lang, "help.1")
+                + t(lang, "help.2")
+                + t(lang, "help.3")
+                + t(lang, "help.4", small=settings.small_file_full_read_mb)
+                + t(
+                    lang,
+                    "help.5",
+                    initial=f"{settings.max_source_fetch_ratio:.0%}",
+                    hard=f"{settings.hard_source_fetch_ratio:.0%}",
+                    cap=settings.max_source_fetch_mb,
                 )
-                if settings.ads_live:
-                    text += f" 看广告可获得 {settings.ad_reward} 次，也存在储存次数里。"
+                + t(lang, "help.6")
+                + t(lang, "help.7")
+                + t(lang, "help.8")
+                + t(lang, "help.9")
+            )
+            if settings.ads_live and SHOW_AD_BUTTON:
+                text += t(lang, "help.10")
+            if not _is_group_message(message):
+                text += t(lang, "help.buttons")
+            if is_admin:
+                text += t(lang, "help.admin")
+                if not _is_group_message(message):
+                    text += t(lang, "help.admin_buttons")
+            if not access.has_grant(user_id):
+                text += t(lang, "help.guest", limit=settings.guest_daily_limit)
+                if settings.ads_live and SHOW_AD_BUTTON:
+                    text += t(lang, "help.guest_ad", reward=settings.ad_reward)
                 if guests_closed(access, guest_gate, user_id):
-                    text += "\n\n" + GUEST_CLOSED_TEXT
+                    text += "\n\n" + t(lang, "guest.closed")
     elif command == "id":
-        text = f"你的 Telegram ID：{user_id or '未知'}"
+        text = t(lang, "id.line", user_id=user_id or t(lang, "unknown_id"))
     elif command == "info":
         sender = getattr(message, "sender", None)
         if sender is None and hasattr(message, "get_sender"):
@@ -898,89 +937,94 @@ async def handle_command(
             limit=limit,
             stored=task_log.stored_credits(user_id) if task_log is not None and user_id is not None else 0,
             guest_open=not guests_closed(access, guest_gate, user_id),
+            lang=lang,
         )
     elif command == "checkin":
         if guests_closed(access, guest_gate, user_id):
-            text = GUEST_CLOSED_TEXT
+            text = t(lang, "guest.closed")
         elif task_log is None or user_id is None:
-            text = "签到暂时不可用。"
+            text = t(lang, "checkin.unavailable")
         else:
             result = task_log.check_in(user_id)
             if result is None:
-                text = f"今天已经签到过了。储存次数：{task_log.stored_credits(user_id)}"
+                text = t(lang, "checkin.already", stored=task_log.stored_credits(user_id))
             else:
                 gained, total = result
-                text = (
-                    f"签到成功，获得 {gained} 次。储存次数：{total}\n"
-                    f"这些次数可以留着，不占每天的 {settings.guest_daily_limit} 次。"
-                )
+                text = t(lang, "checkin.ok", gained=gained, total=total, limit=settings.guest_daily_limit)
     elif command == "ad":
         if _is_group_message(message):
             return True
-        if not settings.ads_enabled:
-            text = "广告功能未开启。"
+        if not SHOW_AD_BUTTON or not settings.ads_enabled:
+            text = t(lang, "ad.disabled")
         elif not settings.ads_live:
-            text = "看广告还未接入。"
+            text = t(lang, "ad.not_live")
         elif guests_closed(access, guest_gate, user_id):
-            text = GUEST_CLOSED_TEXT
+            text = t(lang, "guest.closed")
         else:
-            await _send_watch_ad(client, settings, message, is_admin)
+            await _send_watch_ad(client, settings, message, is_admin, lang)
             return True
     elif command == "status":
         if not is_allowed:
-            text = permission_message(user_id)
+            text = permission_message(user_id, lang)
         else:
             preset = preferences.get(user_id)
             delivery = preferences.get_delivery(user_id)
-            text = (
-                "运行状态：正常\n"
-                f"缩略图：{preset.label} / {settings.thumb_width}px\n"
-                f"发送方式：{delivery_label(delivery)}\n"
-                f"分块缓存：{settings.range_cache_mb}MB 内存 + 临时磁盘去重\n"
-                f"小文件阈值：{settings.small_file_full_read_mb}MB\n"
-                f"大视频预算：初始 {settings.max_source_fetch_ratio:.0%}，"
-                f"按需至 {settings.hard_source_fetch_ratio:.0%}，"
-                f"最高 {settings.max_source_fetch_mb}MB\n"
-                f"任务队列：处理中 {queue.running if queue else 0}，"
-                f"排队 {queue.waiting if queue else 0}"
-                f"（并发 {queue.concurrency if queue else settings.max_concurrent_jobs}）"
+            text = t(
+                lang,
+                "status.body",
+                preset=preset_label(preset.count, preset.cols, preset.rows, lang),
+                width=settings.thumb_width,
+                delivery=delivery_label(delivery, lang),
+                cache=settings.range_cache_mb,
+                small=settings.small_file_full_read_mb,
+                initial=f"{settings.max_source_fetch_ratio:.0%}",
+                hard=f"{settings.hard_source_fetch_ratio:.0%}",
+                cap=settings.max_source_fetch_mb,
+                running=queue.running if queue else 0,
+                waiting=queue.waiting if queue else 0,
+                concurrency=queue.concurrency if queue else settings.max_concurrent_jobs,
             )
     elif command == "setting":
         if not is_allowed:
-            text = permission_message(user_id)
+            text = permission_message(user_id, lang)
         else:
             preset = preferences.get(user_id)
             delivery = preferences.get_delivery(user_id)
             theme = preferences.get_theme(user_id)
-            text = setting_text(preset, delivery, theme)
+            text = setting_text(preset, delivery, theme, lang)
             buttons = setting_buttons(
                 preset,
                 delivery,
                 theme,
                 admin_forward=forward.enabled if is_admin and forward is not None else None,
+                lang=lang,
             )
     elif command in {"add", "del", "users"}:
         if not is_admin:
-            text = "此命令仅限管理员使用。"
+            text = t(lang, "admin.only")
         elif command == "users":
             users = access.users()
-            text = "管理员：" + ", ".join(str(item) for item in sorted(access.admin_ids))
-            text += "\n授权用户：" + (", ".join(str(item) for item in users) if users else "暂无")
+            text = t(lang, "users.admins", ids=", ".join(str(item) for item in sorted(access.admin_ids)))
+            text += "\n" + t(
+                lang,
+                "users.allowed",
+                ids=", ".join(str(item) for item in users) if users else t(lang, "users.none"),
+            )
         else:
             target_id = command_user_id(message.raw_text)
             if target_id is None:
-                text = f"格式错误，请使用 /{command} 用户ID"
+                text = t(lang, "users.bad_format", command=command)
             elif command == "add":
                 added = await access.add(target_id)
-                text = f"已添加用户：{target_id}" if added else f"用户已在授权名单中：{target_id}"
+                text = t(lang, "users.added" if added else "users.already", user_id=target_id)
             elif target_id in access.admin_ids:
-                text = "管理员由环境变量配置，不能通过 /del 删除。"
+                text = t(lang, "users.admin_stuck")
             else:
                 removed = await access.remove(target_id)
-                text = f"已删除用户：{target_id}" if removed else f"用户不在授权名单中：{target_id}"
+                text = t(lang, "users.removed" if removed else "users.missing", user_id=target_id)
     elif command == "guest":
         if not is_admin or guest_gate is None:
-            text = "此命令仅限管理员使用。"
+            text = t(lang, "admin.only")
         else:
             arg = ""
             parts = (message.raw_text or "").split()
@@ -993,36 +1037,33 @@ async def handle_command(
             elif arg in {"toggle", "切换"}:
                 await guest_gate.set_enabled(not guest_gate.enabled)
             known = len(ungranted_user_ids(access, task_log, preferences))
-            text = guest_switch_text(guest_gate.enabled, known)
+            text = guest_switch_text(guest_gate.enabled, known, lang)
     elif command == "bonus":
         if not is_admin or task_log is None:
-            text = "此命令仅限管理员使用。"
+            text = t(lang, "admin.only")
         else:
             amount = bonus_amount(message.raw_text)
-            if amount is None and (message.raw_text or "").strip() in {"/bonus", "加次数"}:
+            bonus_labels = {"/bonus", menu_label("bonus", LANG_ZH), menu_label("bonus", LANG_EN)}
+            if amount is None and (message.raw_text or "").strip() in bonus_labels:
                 if user_id is not None:
                     _bonus_wait.add(user_id)
-                text = f"请发送要增加的次数，1 到 {BONUS_MAX}。只加给已经出现过的非授权用户。"
+                text = t(lang, "bonus.ask", max=BONUS_MAX)
             elif amount is None:
-                text = f"格式错误，请使用 /bonus 次数，例如 /bonus 20。范围 1 到 {BONUS_MAX}。"
+                text = t(lang, "bonus.bad", max=BONUS_MAX)
             else:
                 _bonus_wait.discard(user_id)
                 targets = ungranted_user_ids(access, task_log, preferences)
                 count = task_log.add_stored_many(targets, amount)
-                text = (
-                    f"已给 {count} 个非授权用户各增加 {amount} 次储存次数。\n"
-                    "这些次数不占每天的 10 次，每天的额度用完后才会扣。\n"
-                    "只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。"
-                )
+                text = t(lang, "bonus.done", count=count, amount=amount)
     elif command == "merge":
         if guests_closed(access, guest_gate, user_id):
-            text = GUEST_CLOSED_TEXT
+            text = t(lang, "guest.closed")
         else:
             await _merge_handle(client, settings, access, preferences, message)
             return True
     elif command == "announce":
         if not is_admin:
-            text = "此命令仅限管理员使用。"
+            text = t(lang, "admin.only")
         else:
             await _begin_announce(client, message)
             return True
@@ -1030,17 +1071,17 @@ async def handle_command(
         await _handle_group_command(client, access, groups, message)
         return True
     elif command == "thumb":
-        await _handle_thumb_command(client, access, groups, task_log, message, enqueue)
+        await _handle_thumb_command(client, access, groups, task_log, message, enqueue, preferences)
         return True
     else:
         if _is_group_message(message):
             return True
-        text = "未知命令，请使用 /help 查看可用命令。"
+        text = t(lang, "unknown_command")
     await client.send_message(
         message.chat_id,
         text,
         reply_to=message.id,
-        buttons=_reply_menu(message, is_admin, buttons),
+        buttons=_reply_menu(message, is_admin, buttons, lang),
     )
     return True
 
@@ -1055,12 +1096,13 @@ async def _merge_handle(
     """Parse /merge [N | cancel | status]. All sub-commands in one
     handler to keep state co-located. Called from handle_command."""
     user_id = message.sender_id
+    lang = preferences.get_lang(user_id)
     # Allow any authorized user + admin to use /merge. (Same gate as
     # /add etc. is admin-only; /merge is general utility.)
     if not access.is_allowed(user_id) and not access.is_admin(user_id):
         await client.send_message(
             message.chat_id,
-            permission_message(user_id),
+            permission_message(user_id, lang),
             reply_to=message.id,
         )
         return
@@ -1072,12 +1114,12 @@ async def _merge_handle(
         state = _pending_merge.pop(user_id, None)
         if state is None:
             return await client.send_message(
-                message.chat_id, "ℹ️ 没有等待中的合并任务。", reply_to=message.id,
+                message.chat_id, t(lang, "merge.none"), reply_to=message.id,
             )
         if state["task"] and not state["task"].done():
             state["task"].cancel()
         return await client.send_message(
-            message.chat_id, "✓ 已取消当前合并任务。", reply_to=message.id,
+            message.chat_id, t(lang, "merge.cancelled"), reply_to=message.id,
         )
 
     # ── status ──
@@ -1085,14 +1127,12 @@ async def _merge_handle(
         state = _pending_merge.get(user_id)
         if not state:
             return await client.send_message(
-                message.chat_id, "ℹ️ 当前没有等待中的合并任务。", reply_to=message.id,
+                message.chat_id, t(lang, "merge.none_now"), reply_to=message.id,
             )
         remain = state["expected_count"] - state["received_count"]
         return await client.send_message(
             message.chat_id,
-            f"⏱ {state['received_count']}/{state['expected_count']} 已收, 还差 {remain} 条。\n"
-            f"5 秒静默后开始合并。\n"
-            f"取消: /merge cancel",
+            t(lang, "merge.status", got=state["received_count"], expected=state["expected_count"], remain=remain),
             reply_to=message.id,
         )
 
@@ -1100,8 +1140,7 @@ async def _merge_handle(
     if user_id in _pending_merge:
         return await client.send_message(
             message.chat_id,
-            "⚠️ 你已经有等待中的合并任务。\n"
-            "先发完或发送 /merge cancel 取消。",
+            t(lang, "merge.busy"),
             reply_to=message.id,
         )
     if arg == "":
@@ -1112,14 +1151,13 @@ async def _merge_handle(
         except ValueError:
             return await client.send_message(
                 message.chat_id,
-                f"✗ 用法: /merge [N | cancel | status]\n"
-                f"  N 范围: {MERGE_MIN_COUNT}-{MERGE_MAX_COUNT}。",
+                t(lang, "merge.usage", lo=MERGE_MIN_COUNT, hi=MERGE_MAX_COUNT),
                 reply_to=message.id,
             )
         if n < MERGE_MIN_COUNT or n > MERGE_MAX_COUNT:
             return await client.send_message(
                 message.chat_id,
-                f"✗ N 必须是 {MERGE_MIN_COUNT}-{MERGE_MAX_COUNT} 之间的整数。",
+                t(lang, "merge.bad_n", lo=MERGE_MIN_COUNT, hi=MERGE_MAX_COUNT),
                 reply_to=message.id,
             )
 
@@ -1131,16 +1169,13 @@ async def _merge_handle(
         "task": None,
         "started_at": asyncio.get_event_loop().time(),
         "notify_msg_id": None,
+        "lang": lang,
     }
     _pending_merge[user_id] = state
 
     notify = await client.send_message(
         message.chat_id,
-        f"✓ 模式开启, 等待接下来 {n} 条媒体消息。\n"
-        f"  支持: 图片 / 视频 / 文件视频 / 动图 / 圆视频。\n"
-        f"  图片会排在前, 视频排在后, 自带的说明文字会被去除。\n"
-        f"  5 秒静默后开始合并。\n"
-        f"  取消: /merge cancel",
+        t(lang, "merge.armed", n=n),
         reply_to=message.id,
     )
     state["notify_msg_id"] = notify.id
@@ -1185,7 +1220,7 @@ async def _merge_collect_media(
         )
         await client.send_message(
             message.chat_id,
-            f"⏱ {recv}/{expected}, 等待第 {recv + 1} 条...",
+            t(state.get("lang"), "merge.wait_next", got=recv, expected=expected, next=recv + 1),
             reply_to=message.id,
         )
         return True
@@ -1197,7 +1232,7 @@ async def _merge_collect_media(
     )
     await client.send_message(
         message.chat_id,
-        f"⏱ {recv}/{expected}, 5 秒后开始合并...",
+        t(state.get("lang"), "merge.soon", got=recv, expected=expected),
         reply_to=message.id,
     )
     return True
@@ -1348,7 +1383,7 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
         if not media:
             await client.send_message(
                 chat_id,
-                "✗ 没有可合并的媒体 (全部 file_id 缺失)。请重新 /merge。",
+                t(state.get("lang"), "merge.empty"),
             )
             return
 
@@ -1382,22 +1417,21 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
                 else:
                     await client.send_message(
                         chat_id,
-                        f"⚠️ 第 {batch_start + 1}-{batch_start + len(batch)} 条合并失败: {e}",
+                        t(state.get("lang"), "merge.batch_fail", start=batch_start + 1, end=batch_start + len(batch), error=e),
                     )
                     continue
     finally:
         if tmp_dir is not None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    summary = [f"✓ 已合并 {state['expected_count']} 条 ({len(photos)} 图 + {len(videos)} 视频)"]
+    mlang = state.get("lang")
+    summary = [t(mlang, "merge.summary", expected=state["expected_count"], photos=len(photos), videos=len(videos))]
     if sent:
-        summary.append(f"  成功发送 {sent}/{len(media)} 条")
+        summary.append(t(mlang, "merge.sent", sent=sent, total=len(media)))
     if failed_indices:
         idx_list = ", ".join(str(i) for i in failed_indices)
         summary.append("")
-        summary.append(f"✗ 第 {idx_list} 条 file_id 已失效 (Telegram 缓存已清理)。")
-        summary.append("  请在 Telegram 长按原消息 → 引用回复 → 把那条转发给我。")
-        summary.append("  然后重新发送 /merge 即可。")
+        summary.append(t(mlang, "merge.stale", indexes=idx_list))
     try:
         await client.send_message(chat_id, "\n".join(summary))
     except Exception:
@@ -1408,7 +1442,7 @@ async def _merge_fire(client: TelegramClient, state: dict, user_id: int) -> None
     notify_id = state.get("notify_msg_id")
     if notify_id is not None:
         try:
-            await client.delete_messages(chat_id, [notify_id])
+            await delete_own_message(client, chat_id, int(notify_id))
         except Exception:
             pass
 
@@ -1515,16 +1549,13 @@ def ungranted_user_ids(access: AccessControl, task_log: "TaskLog | None", prefer
         found.update(int(item) for item in getattr(preferences, "values", {}))
         found.update(int(item) for item in getattr(preferences, "delivery_modes", {}))
         found.update(int(item) for item in getattr(preferences, "theme_modes", {}))
+        found.update(int(item) for item in getattr(preferences, "languages", {}))
     return sorted(user_id for user_id in found if user_id > 0 and not access.has_grant(user_id))
 
 
-def guest_switch_text(enabled: bool, known: int) -> str:
-    state = "开放" if enabled else "已关闭"
-    return (
-        f"非授权用户使用：{state}\n"
-        f"已记录的非授权用户：{known} 人\n"
-        "授权用户和管理员不受影响。"
-    )
+def guest_switch_text(enabled: bool, known: int, lang: str | None = None) -> str:
+    state = t(lang, "guest.open") if enabled else t(lang, "guest.shut")
+    return t(lang, "guest.switch", state=state, known=known)
 
 
 def account_info_text(
@@ -1537,6 +1568,7 @@ def account_info_text(
     limit: int,
     stored: int = 0,
     guest_open: bool = True,
+    lang: str | None = None,
 ) -> str:
     name = ""
     username = None
@@ -1546,25 +1578,25 @@ def account_info_text(
         last = (getattr(sender, "last_name", None) or "").strip()
         name = " ".join(part for part in (first, last) if part)
     lines = [
-        "账号信息",
-        f"名字：{name or '未设置'}",
-        f"用户名：@{username}" if username else "用户名：无",
-        f"Telegram ID：{user_id or '未知'}",
+        t(lang, "info.title"),
+        t(lang, "info.name", name=name or t(lang, "info.unset")),
+        t(lang, "info.username", name=f"@{username}") if username else t(lang, "info.no_username"),
+        t(lang, "info.id", user_id=user_id or t(lang, "unknown_id")),
     ]
     if is_admin:
-        lines.append("授权用户：是（管理员）")
-        lines.append("今日剩余次数：不限")
+        lines.append(t(lang, "info.grant_admin"))
+        lines.append(t(lang, "info.unlimited"))
     elif granted:
-        lines.append("授权用户：是")
-        lines.append("今日剩余次数：不限")
+        lines.append(t(lang, "info.grant_yes"))
+        lines.append(t(lang, "info.unlimited"))
     else:
         remaining = max(int(limit) - int(used), 0)
-        lines.append("授权用户：否")
-        lines.append(f"今日剩余次数：{remaining}/{limit}")
-        lines.append(f"储存次数：{stored}")
-        lines.append("使用以前的生成记录不计入次数。每日签到获得的次数会存在这里。")
+        lines.append(t(lang, "info.grant_no"))
+        lines.append(t(lang, "info.remaining", remaining=remaining, limit=limit))
+        lines.append(t(lang, "info.stored", stored=stored))
+        lines.append(t(lang, "info.reuse_note"))
         if not guest_open:
-            lines.append("使用状态：已关闭")
+            lines.append(t(lang, "info.closed"))
     return "\n".join(lines)
 
 
@@ -1581,15 +1613,11 @@ def format_user_label(sender: Any, user_id: int | None) -> str:
     return str(user_id or "未知")
 
 
-def format_forward_notice(label: str, user_id: int | None, count: int) -> str:
-    safe = html.escape(label or str(user_id or "未知"), quote=True)
+def format_forward_notice(label: str, user_id: int | None, count: int, lang: str | None = None) -> str:
+    safe = html.escape(label or str(user_id or t(lang, "unknown_id")), quote=True)
     if user_id:
-        return (
-            f"用户 {safe} "
-            f'(<a href="tg://user?id={int(user_id)}">{int(user_id)}</a>) '
-            f"完成 {count} 个任务"
-        )
-    return f"用户 {safe} 完成 {count} 个任务"
+        return t(lang, "forward.done", label=safe, user_id=int(user_id), count=count)
+    return t(lang, "forward.done_plain", label=safe, count=count)
 
 
 _pending_forward: dict[int, dict] = {}
@@ -1681,7 +1709,6 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
     items = state["items"]
     label = state.get("label") or str(user_id)
     count = len(items)
-    notice = format_forward_notice(label, user_id, count)
     pngs = [item["png"] for item in items if item.get("png") and Path(item["png"]).exists()]
     videos = []
     for item in items:
@@ -1701,6 +1728,7 @@ async def _forward_flush(client: TelegramClient, access: AccessControl, user_id:
         if _flood.remaining(FLOOD_MEDIA) > 0:
             deferred = True
             break
+        notice = format_forward_notice(label, user_id, count, user_lang(admin_id))
         try:
             await client.send_message(admin_id, notice, parse_mode="html")
         except FloodWaitError as exc:
@@ -1799,14 +1827,11 @@ def _is_file_sent_video(message: Any) -> bool:
     return extract_video(message) is not None and getattr(message, "video", None) is None
 
 
-def pack_offer_prompt(is_file_video: bool, remux_max_mb: int, *, allow_remux: bool = False) -> str:
+def pack_offer_prompt(is_file_video: bool, remux_max_mb: int, *, allow_remux: bool = False, lang: str | None = None) -> str:
     del remux_max_mb, allow_remux
     if is_file_video:
-        return (
-            "这个视频是按文件发送的，Telegram 不能直接内嵌播放。\n"
-            "要不要把缩略图和原文件合并成一条？合并后仍是文件形式。"
-        )
-    return "要不要把缩略图和原视频合并成一条消息，方便转发？"
+        return t(lang, "pack.file")
+    return t(lang, "pack.inline")
 
 
 def _source_file_size(message: Any) -> int:
@@ -1938,6 +1963,7 @@ async def _offer_pack_forward(
     queue: "JobQueue | None" = None,
     remux_max_mb: int = 1024,
     allow_remux: bool = False,
+    lang: str | None = None,
 ) -> None:
     if result_msg is None or source_msg is None:
         return
@@ -1963,16 +1989,17 @@ async def _offer_pack_forward(
         "remux_max_mb": remux_max_mb,
         "file_size": _source_file_size(source_msg),
         "expires": time.time() + PACK_OFFER_TTL_SEC,
+        "lang": lang,
     }
     buttons = [
         [
-            Button.inline("合并为一条", f"pack:y:{token}".encode()),
-            Button.inline("不用了", f"pack:n:{token}".encode()),
+            Button.inline(t(lang, "pack.yes"), f"pack:y:{token}".encode()),
+            Button.inline(t(lang, "pack.no"), f"pack:n:{token}".encode()),
         ]
     ]
     await client.send_message(
         source_msg.chat_id,
-        pack_offer_prompt(is_file_video, remux_max_mb),
+        pack_offer_prompt(is_file_video, remux_max_mb, lang=lang),
         buttons=buttons,
         reply_to=getattr(result_msg, "id", None),
     )
@@ -2102,24 +2129,25 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
     raw = (event.data or b"").decode("utf-8", "replace")
     parts = raw.split(":")
     if len(parts) != 3 or parts[0] != "pack" or parts[1] not in {"y", "n", "r"}:
-        await event.answer("按钮已失效。", alert=True)
+        await event.answer(t(user_lang(event.sender_id), "pack.expired_toast"), alert=True)
         return
     action, token = parts[1], parts[2]
     offer = _pack_offers.get(token)
+    plang = (offer or {}).get("lang") or user_lang(event.sender_id)
     if offer is None or offer.get("expires", 0) < time.time():
         _drop_pack_offer(token)
-        await event.answer("这条询问已过期。", alert=True)
+        await event.answer(t(plang, "pack.offer_expired_toast"), alert=True)
         with contextlib.suppress(Exception):
-            await event.edit("这条合并询问已过期。")
+            await event.edit(t(plang, "pack.offer_expired"))
         return
     if event.sender_id != offer["user_id"]:
-        await event.answer("这不是你的任务。", alert=True)
+        await event.answer(t(plang, "pack.not_yours"), alert=True)
         return
     if action == "n":
         _drop_pack_offer(token)
-        await event.answer("好的")
+        await event.answer(t(plang, "pack.ok"))
         with contextlib.suppress(Exception):
-            await event.edit("好的，保持分开发送。")
+            await event.edit(t(plang, "pack.kept"))
         return
     if action == "r":
         action = "y"
@@ -2132,24 +2160,23 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
     )
     use_files = source_is_file or result_is_file
     if use_files:
-        await event.answer("将以文件形式发送，请稍候")
+        await event.answer(t(plang, "pack.as_file_toast"))
         with contextlib.suppress(Exception):
             await event.edit(
-                "图片无法和文件视频合成相册，将以文件形式发送（仍是一条消息）。\n"
-                "大文件可能较慢，请稍候…",
+                t(plang, "pack.as_file"),
                 buttons=None,
             )
         progress_stage = "pack"
     else:
-        await event.answer("正在合并，请稍候")
+        await event.answer(t(plang, "pack.merging_toast"))
         with contextlib.suppress(Exception):
-            await event.edit("正在把缩略图和视频合成一条消息…", buttons=None)
+            await event.edit(t(plang, "pack.merging"), buttons=None)
         progress_stage = "pack_media"
     sheet_file = offer.get("sheet_path")
     sheet = None
     if use_files and sheet_file and Path(sheet_file).exists():
         sheet = str(sheet_file)
-    progress = ProgressReporter(event.client, offer["chat_id"], event.message_id)
+    progress = ProgressReporter(event.client, offer["chat_id"], event.message_id, plang)
     try:
         await progress.show_now(progress_stage, 0, 1)
         sent_ok = await _send_pack_album(
@@ -2165,13 +2192,13 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
         logging.exception("pack-forward crashed")
         sent_ok = False
     if not sent_ok:
-        await progress.finish("合并发送失败，请稍后重试。")
+        await progress.finish(t(plang, "pack.fail"))
         return
     _drop_pack_offer(token)
     await progress.finish(
-        "已合并为一条文件消息，可长按转发。"
+        t(plang, "pack.done_file")
         if progress_stage == "pack"
-        else "已合并为一条消息，可长按转发。"
+        else t(plang, "pack.done_media")
     )
 
 
@@ -2180,44 +2207,68 @@ async def _handle_pack_callback(event: events.CallbackQuery.Event) -> None:
 _pending_merge: dict[int, dict] = {}
 
 
+async def sync_user_commands(
+    client: TelegramClient,
+    user_id: int,
+    lang: str | None,
+    *,
+    is_admin: bool,
+    ads_enabled: bool = False,
+) -> None:
+    """Lock this private chat's slash menu to the in-bot language.
+
+    Telegram otherwise picks the menu from the phone language. Setting the same
+    list on every lang_code for this peer stops the phone language from winning.
+    """
+    try:
+        peer = await client.get_input_entity(int(user_id))
+        commands = [
+            types.BotCommand(command=name, description=description)
+            for name, description in command_pairs(lang, include_admin=is_admin, ads_enabled=ads_enabled)
+        ]
+        for code in ("", LANG_ZH, LANG_EN):
+            await client(
+                functions.bots.SetBotCommandsRequest(
+                    scope=types.BotCommandScopePeer(peer),
+                    lang_code=code,
+                    commands=commands,
+                )
+            )
+    except Exception:
+        logging.warning("Could not set command menu for %s", user_id)
+
+
 async def set_bot_commands(client: TelegramClient, admin_ids: frozenset[int] | set[int] = frozenset(), ads_enabled: bool = False) -> None:
     def listed(pairs):
         return [types.BotCommand(command=name, description=description) for name, description in pairs]
 
-    user_pairs = USER_COMMANDS if ads_enabled else tuple(item for item in USER_COMMANDS if item[0] != "ad")
-    await client(
-        functions.bots.SetBotCommandsRequest(
-            scope=types.BotCommandScopeDefault(),
-            lang_code="",
-            commands=listed(user_pairs),
-        )
-    )
-    admin_pairs = user_pairs + ADMIN_COMMANDS
-    for admin_id in admin_ids:
-        try:
-            peer = await client.get_input_entity(int(admin_id))
-        except Exception:
-            logging.warning("Could not set admin command menu for %s", admin_id)
-            continue
+    # Default scope still follows the phone language, for people who have not
+    # opened a private chat since the switch. A private /start or language change
+    # then locks that chat to the in-bot language.
+    for code in ("", LANG_ZH, LANG_EN):
+        catalog = LANG_EN if code == LANG_EN else LANG_ZH
         await client(
             functions.bots.SetBotCommandsRequest(
-                scope=types.BotCommandScopePeer(peer),
-                lang_code="",
-                commands=listed(admin_pairs),
+                scope=types.BotCommandScopeDefault(),
+                lang_code=code,
+                commands=listed(command_pairs(catalog, ads_enabled=ads_enabled)),
             )
         )
+    for admin_id in admin_ids:
+        admin_lang = _preferences.get_lang(admin_id) if _preferences is not None else LANG_ZH
+        await sync_user_commands(client, int(admin_id), admin_lang, is_admin=True, ads_enabled=ads_enabled)
 
 
-async def _send_watch_ad(client: TelegramClient, settings: Settings, message: Any, is_admin: bool) -> None:
+async def _send_watch_ad(client: TelegramClient, settings: Settings, message: Any, is_admin: bool, lang: str | None = None) -> None:
     chat_id = message.chat_id
     user_id = message.sender_id
     block = numeric_block_id(settings.adsgram_block_id)
     if not block or not settings.adsgram_token or user_id is None:
         await client.send_message(
             chat_id,
-            "看广告还没接上，稍后再试。",
+            t(lang, "ad.not_connected"),
             reply_to=message.id,
-            buttons=_reply_menu(message, is_admin),
+            buttons=_reply_menu(message, is_admin, lang=lang),
         )
         return
     try:
@@ -2339,19 +2390,11 @@ def _png_to_jpeg(src: Path, dst: Path) -> None:
     )
 
 
-def format_progress(stage: str, current: int, total: int) -> str:
-    labels = {
-        "metadata": "正在读取视频信息",
-        "frames": "正在截取视频帧",
-        "compose": "正在合成缩略图",
-        "prepare_upload": "正在准备上传图片",
-        "upload": "正在上传成品图片",
-        "pack": "正在以文件形式发送（图片+原视频）",
-        "pack_media": "正在合并为一条媒体消息",
-        "remux_dl": "正在下载原文件以便封装",
-        "remux": "正在无损封装为可播放视频",
-    }
-    label = labels.get(stage, "正在处理")
+def format_progress(stage: str, current: int, total: int, lang: str | None = None) -> str:
+    label = t(lang, f"progress.{stage}") if f"progress.{stage}" in {
+        "progress.metadata", "progress.frames", "progress.compose", "progress.prepare_upload",
+        "progress.upload", "progress.pack", "progress.pack_media", "progress.remux_dl", "progress.remux",
+    } else t(lang, "progress.working")
     ratio = min(1.0, max(0.0, current / total)) if total > 0 else 0.0
     width = 12
     filled = round(ratio * width)
@@ -2376,26 +2419,17 @@ def short_filename(name: str) -> str:
     return name[:77] + "..." if len(name) > 80 else name
 
 
-def format_queue_status(ahead: int, filename: str) -> str:
+def format_queue_status(ahead: int, filename: str, lang: str | None = None) -> str:
     name = short_filename(filename)
     if ahead <= 0:
-        return "轮到你了，开始处理。"
-    return (
-        f"⏳ 已加入队列，按到达顺序处理。\n"
-        f"前面还有 {ahead} 个任务\n"
-        f"文件：{name}\n"
-        f"请稍候，轮到时会自动开始。"
-    )
+        return t(lang, "queue.turn")
+    return t(lang, "queue.joined", ahead=ahead, name=name)
 
 
-def format_queue_batch(waiting: int) -> str:
+def format_queue_batch(waiting: int, lang: str | None = None) -> str:
     """One line for a whole chat, not one reply per file."""
     count = max(1, int(waiting))
-    return (
-        "已加入队列，按到达顺序处理。\n"
-        f"后面还有 {count} 个\n"
-        "正在处理的会显示进度，轮到时自动开始。"
-    )
+    return t(lang, "queue.batch", count=count)
 
 
 # Quiet period so a burst of files is counted before the one notice goes out.
@@ -2442,13 +2476,14 @@ class JobQueue:
         *,
         quote_top_id: int | None = None,
         peer: Any = None,
+        lang: str | None = None,
     ) -> QueueTicket:
         ticket = QueueTicket(client, chat_id, filename)
         async with self._lock:
             ahead = self._running + len(self._waiters)
             self._waiters.append(ticket)
             if ahead > 0:
-                self._bump_batch_locked(chat_id, client, reply_to, quote_top_id, peer)
+                self._bump_batch_locked(chat_id, client, reply_to, quote_top_id, peer, lang)
         # Claim the slot before any Telegram await. The summary is sent later,
         # after a short quiet period, and must not affect who runs first.
         if ahead > 0:
@@ -2481,6 +2516,7 @@ class JobQueue:
         reply_to: int,
         quote_top_id: int | None,
         peer: Any,
+        lang: str | None = None,
     ) -> None:
         state = self._batches.get(chat_id)
         if state is None:
@@ -2493,6 +2529,7 @@ class JobQueue:
                 "task": None,
                 "message_id": None,
                 "last_text": "",
+                "lang": lang,
             }
             self._batches[chat_id] = state
         state["waiting"] += 1
@@ -2501,6 +2538,7 @@ class JobQueue:
             state["reply_to"] = reply_to
             state["quote_top_id"] = quote_top_id
             state["peer"] = peer
+            state["lang"] = lang
 
     def _drop_batch_locked(self, chat_id: int) -> None:
         state = self._batches.get(chat_id)
@@ -2538,10 +2576,9 @@ class JobQueue:
             message_id = state.get("message_id")
             self._batches.pop(chat_id, None)
             if message_id:
-                with contextlib.suppress(Exception):
-                    await client.delete_messages(chat_id, [message_id])
+                await delete_own_message(client, chat_id, int(message_id))
             return
-        text = format_queue_batch(waiting)
+        text = format_queue_batch(waiting, state.get("lang"))
         if state.get("message_id") and text == state.get("last_text"):
             return
         if state.get("message_id"):
@@ -2620,8 +2657,7 @@ async def _send_flood_notice(
     if chat_id is None:
         return
     text = (
-        f"Telegram 正在限制发送，预计 {resume_clock(wait)} 恢复。"
-        "这段时间发视频不会开始生成，也不扣次数。到点后再发一次就行。"
+        t(None, "flood.notice", when=resume_clock(wait))
     )
     try:
         await client.send_message(chat_id, text, reply_to=getattr(message, "id", None))
@@ -2636,10 +2672,11 @@ async def _send_flood_notice(
 
 
 class ProgressReporter:
-    def __init__(self, client: TelegramClient, chat_id: int, message_id: int) -> None:
+    def __init__(self, client: TelegramClient, chat_id: int, message_id: int, lang: str | None = None) -> None:
         self.client = client
         self.chat_id = chat_id
         self.message_id = message_id
+        self.lang = lang or DEFAULT_LANG
         self.loop = asyncio.get_running_loop()
         self.state: tuple[str, int, int] = ("metadata", 0, 1)
         self.last_text = ""
@@ -2655,10 +2692,11 @@ class ProgressReporter:
         reply_to: int,
         existing_id: int | None = None,
         buttons=None,
+        lang: str | None = None,
     ) -> "ProgressReporter":
-        start_text = format_progress("metadata", 0, 1)
+        start_text = format_progress("metadata", 0, 1, lang)
         if existing_id is not None:
-            reporter = cls(client, chat_id, existing_id)
+            reporter = cls(client, chat_id, existing_id, lang)
             await reporter._edit(start_text)
             return reporter
         # Reply keyboards make this message uneditable (MessageIdInvalidError),
@@ -2668,7 +2706,7 @@ class ProgressReporter:
             start_text,
             reply_to=reply_to,
         )
-        return cls(client, chat_id, message.id)
+        return cls(client, chat_id, message.id, lang)
 
     def report(self, stage: str, current: int | float, total: int | float) -> None:
         try:
@@ -2695,7 +2733,7 @@ class ProgressReporter:
         with contextlib.suppress(asyncio.CancelledError):
             await self.task
         with contextlib.suppress(Exception):
-            await self.client.delete_messages(self.chat_id, [self.message_id])
+            await delete_own_message(self.client, self.chat_id, self.message_id)
 
     async def _run(self) -> None:
         while True:
@@ -2711,7 +2749,7 @@ class ProgressReporter:
         # refresh at most once per PROGRESS_EDIT_INTERVAL.
         if not force and time.monotonic() - self.last_edit_at < PROGRESS_EDIT_INTERVAL:
             return
-        sent = await self._edit(format_progress(*self.state))
+        sent = await self._edit(format_progress(*self.state, self.lang))
         if sent:
             self.dirty = False
 
@@ -2736,34 +2774,21 @@ class ProgressReporter:
             return False
 
 
-def user_error_message(exc: Exception) -> str:
+def user_error_message(exc: Exception, lang: str | None = None) -> str:
     if isinstance(exc, FetchBudgetExceeded):
         fetched_mb = exc.fetched / 1024 / 1024
         limit_mb = exc.budget / 1024 / 1024
-        return (
-            f"这个视频的索引或关键帧不利于随机截取，已读取 {fetched_mb:.1f}MB，"
-            f"达到自适应硬上限 {limit_mb:.1f}MB。为避免接近全量下载，任务已主动停止。"
-        )
+        return t(lang, "error.budget", fetched=f"{fetched_mb:.1f}", limit=f"{limit_mb:.1f}")
     if isinstance(exc, subprocess.TimeoutExpired):
-        return "截帧超时，请稍后重试，或提高 FFMPEG_TIMEOUT。"
+        return t(lang, "error.timeout")
     if isinstance(exc, subprocess.CalledProcessError):
-        # Surface the actual ffmpeg error to the user instead of a generic message.
-        # ffmpeg's stderr/stdout was captured but never logged previously -- the
-        # catch was swallowing the diagnostic. Embed a short excerpt in the user
-        # message; the full stderr still goes to container logs via the caller.
         err = (exc.stderr or "").strip()
         if not err and exc.stdout:
             err = (exc.stdout or "").strip()
-        # Telegram caps outgoing text at 4096 bytes; budget for ~600 chars of
-        # ffmpeg-output plus a short prefix so the message still fits.
         excerpt = err[:600].replace("\r\n", "\n")
-        suffix = (f"\n\nffmpeg 输出：\n{excerpt}" if excerpt else
-                  f"\n\n（未捕获到 ffmpeg 错误输出，请查看容器日志）")
-        return (
-            "无法读取或截取这个视频。"
-            f"可能是格式、远程读取或代理连接问题。{suffix}"
-        )
-    return "生成失败，请查看容器日志中的错误类型。"
+        suffix = t(lang, "error.ffmpeg", excerpt=excerpt) if excerpt else t(lang, "error.no_ffmpeg")
+        return t(lang, "error.unreadable", suffix=suffix)
+    return t(lang, "error.failed")
 
 
 _reuse_offers: dict[str, dict] = {}
@@ -2789,6 +2814,7 @@ async def _offer_previous_result(
     requester_id: int | None = None,
     enqueue_kwargs: dict | None = None,
     mention_html: str | None = None,
+    lang: str | None = None,
 ) -> None:
     _purge_reuse_offers()
     token = secrets.token_hex(4)
@@ -2804,15 +2830,15 @@ async def _offer_previous_result(
         "mention_html": mention_html or "",
         "reply_to": getattr(message, "id", None),
     }
-    text = "这个视频已经有生成记录，别人生成过的也可以用。\n要直接使用之前的缩略图，还是重新生成？"
+    text = t(lang, "reuse.prompt")
     if mention_html:
         text = f"{mention_html}\n{text}"
     await client.send_message(
         message.chat_id,
         text,
         buttons=[[
-            Button.inline("使用之前的", f"reuse:y:{token}".encode()),
-            Button.inline("重新生成", f"reuse:n:{token}".encode()),
+            Button.inline(t(lang, "reuse.yes"), f"reuse:y:{token}".encode()),
+            Button.inline(t(lang, "reuse.no"), f"reuse:n:{token}".encode()),
         ]],
         reply_to=message.id,
         parse_mode="html" if mention_html else None,
@@ -2895,6 +2921,7 @@ async def process_message(
     header_msg_id: int | None = None,
     mention_user_id: int | None = None,
     mention_label: str | None = None,
+    cleanup_msg_ids: list[int] | None = None,
 ) -> None:
     chat_id = message.chat_id
     message_id = message.id
@@ -2911,10 +2938,12 @@ async def process_message(
         return
 
     filename = video.get("file_name") or "telegram-video.mp4"
+    pref_id = preference_user_id if preference_user_id is not None else message.sender_id
+    sheet_lang = preferences.get_lang(pref_id)
     peer = await _input_peer(client, message, chat_id) if quote_msg_id else None
     ticket = await queue.join(
         client, chat_id, reply_id, Path(filename).name,
-        quote_top_id=quote_top_id, peer=peer,
+        quote_top_id=quote_top_id, peer=peer, lang=sheet_lang,
     )
     try:
         pref_id = preference_user_id if preference_user_id is not None else message.sender_id
@@ -2929,14 +2958,14 @@ async def process_message(
                 opening = await _send_text_quoting(
                     client,
                     peer,
-                    format_progress("metadata", 0, 1),
+                    format_progress("metadata", 0, 1, sheet_lang),
                     reply_id,
                     quote_top_id,
                 )
-                progress = ProgressReporter(client, chat_id, opening.id)
+                progress = ProgressReporter(client, chat_id, opening.id, sheet_lang)
             else:
                 progress = await ProgressReporter.create(
-                    client, chat_id, reply_id, existing_id=ticket.status_id,
+                    client, chat_id, reply_id, existing_id=ticket.status_id, lang=sheet_lang,
                 )
             file_size = video.get("file_size")
             if not isinstance(file_size, int) or file_size <= 0:
@@ -2966,6 +2995,7 @@ async def process_message(
                 timeout=settings.ffmpeg_timeout,
                 theme=THEME_BY_NAME[theme],
                 progress_callback=progress.report,
+                lang=sheet_lang,
             )
             send_path = output
             caption_name = f"{source.filename}.png"
@@ -3011,8 +3041,11 @@ async def process_message(
                 )
             if quote_msg_id:
                 await progress.dismiss()
+                for extra_id in cleanup_msg_ids or []:
+                    if extra_id and int(extra_id) != progress.message_id:
+                        await delete_own_message(client, chat_id, int(extra_id))
             else:
-                await progress.finish("处理完成，缩略图已发送。")
+                await progress.finish(t(sheet_lang, "done.sheet"))
             if isinstance(sent, list):
                 sent = sent[0] if sent else None
             saved_key = file_key(message)
@@ -3034,6 +3067,7 @@ async def process_message(
                         output,
                         queue=queue,
                         remux_max_mb=settings.remux_max_mb,
+                        lang=sheet_lang,
                     )
             if access is not None and forward is not None:
                 await _forward_note_success(
@@ -3069,8 +3103,8 @@ async def process_message(
             try:
                 if flood_wait:
                     error_text = (
-                        "处理失败：Telegram 限制发送，预计还要等 "
-                        f"{describe_wait(flood_wait)}。"
+                        t(sheet_lang, "error.flood")
+                        + f"{describe_wait(flood_wait, sheet_lang)}。"
                     )
                     # Nothing was delivered, so do not eat the caller's slot.
                     payer = preference_user_id if preference_user_id is not None else message.sender_id
@@ -3082,13 +3116,17 @@ async def process_message(
                     ):
                         task_log.refund(payer)
                 else:
-                    error_text = "处理失败：" + user_error_message(exc)
+                    error_text = t(sheet_lang, "error.prefix") + user_error_message(exc, sheet_lang)
                 if progress:
                     await progress.finish(error_text)
                 elif quote_msg_id and peer is not None:
                     await _send_text_quoting(client, peer, error_text, reply_id, quote_top_id)
                 else:
                     await client.send_message(chat_id, error_text, reply_to=message_id)
+                if quote_msg_id:
+                    for extra_id in cleanup_msg_ids or []:
+                        if extra_id and (progress is None or int(extra_id) != progress.message_id):
+                            await delete_own_message(client, chat_id, int(extra_id))
             except Exception as reply_exc:
                 logging.error(
                     "Could not send failure message for %s (%s)",
@@ -3106,8 +3144,12 @@ async def process_message(
 async def poll() -> None:
     settings = Settings.from_env()
     configure_logging(settings.bot_token)
+    global _bot_token
+    _bot_token = settings.bot_token
     access = AccessControl(Path(settings.access_file), settings.admin_ids, open_access=settings.open_access)
     preferences = UserPreferences(Path(settings.preferences_file))
+    global _preferences
+    _preferences = preferences
     session_path = Path(settings.access_file).with_name("mtproto")
     session = SQLiteSession(str(session_path))
     # DC1 is much faster for 512KB chunk reads than a fresh login on DC5.
@@ -3137,6 +3179,10 @@ async def poll() -> None:
     )
     global _audience
     _audience = Audience(Path(settings.access_file).with_name("audience.json"))
+    known = set(_audience.ids())
+    known.update(task_log.known_user_ids())
+    known.update(preferences.known_user_ids())
+    await preferences.adopt_existing(known)
     global _flood
     _flood = FloodGate(Path(settings.access_file).with_name("flood.json"))
     global _forward_store, _announce_ledger, _spool_root
@@ -3168,6 +3214,7 @@ async def poll() -> None:
         header_msg_id: int | None = None,
         mention_user_id: int | None = None,
         mention_label: str | None = None,
+        cleanup_msg_ids: list[int] | None = None,
     ) -> None:
         user_id = preference_user_id if preference_user_id is not None else message.sender_id
         wait = _flood.remaining(FLOOD_MEDIA)
@@ -3191,6 +3238,7 @@ async def poll() -> None:
                 header_msg_id=header_msg_id,
                 mention_user_id=mention_user_id,
                 mention_label=mention_label,
+                cleanup_msg_ids=cleanup_msg_ids,
             )
         )
         tasks.add(task)
@@ -3291,12 +3339,15 @@ async def poll() -> None:
             return
         record = task_log.lookup(key, content_key(event.message))
         if record:
-            await _offer_previous_result(mt_client, event.message, record, key or "")
+            await _offer_previous_result(
+                mt_client, event.message, record, key or "",
+                lang=preferences.get_lang(event.sender_id),
+            )
             return
         if not access.has_grant(event.sender_id) and not task_log.can_generate(event.sender_id):
             await mt_client.send_message(
                 event.chat_id,
-                quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live),
+                quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live and SHOW_AD_BUTTON),
                 reply_to=event.message.id,
                 buttons=main_menu(access.is_admin(event.sender_id)) if event.is_private else None,
             )
@@ -3335,22 +3386,25 @@ async def poll() -> None:
                     mention_html=offer.get("mention_html") or "",
                     video=message,
                 )
-                done = "已把之前的缩略图发给你，并引用了原视频。这次不计入生成次数。"
+                done = t(user_lang(event.sender_id), "reuse.sent_group")
             else:
                 ok = await _forward_saved_result(mt_client, message.chat_id, offer["record"])
-                done = "已把之前的图片和视频合并成一条发给你。这次不计入生成次数。"
+                done = t(user_lang(event.sender_id), "reuse.sent_private")
             await event.answer("已发送" if ok else "发送失败")
-            with contextlib.suppress(Exception):
-                await event.edit(
-                    done if ok else "之前的记录已失效，无法发送。可以再发一次并选择重新生成。",
-                    buttons=None,
-                )
+            if ok and offer.get("group"):
+                await delete_own_message(mt_client, event.chat_id, event.message_id)
+            else:
+                with contextlib.suppress(Exception):
+                    await event.edit(
+                        done if ok else "之前的记录已失效，无法发送。可以再发一次并选择重新生成。",
+                        buttons=None,
+                    )
             return
         if not access.has_grant(requester) and not task_log.can_generate(requester):
-            await event.answer("今天的次数已用完，可先签到" + ("或看广告" if settings.ads_live else ""), alert=True)
+            await event.answer("今天的次数已用完，可先签到" + (("或看广告" if settings.ads_live else "") if SHOW_AD_BUTTON else ""), alert=True)
             with contextlib.suppress(Exception):
                 await event.edit(
-                    quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live),
+                    quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live and SHOW_AD_BUTTON),
                     buttons=None,
                 )
             return
@@ -3359,7 +3413,12 @@ async def poll() -> None:
         note = "好的，重新生成。" if access.has_grant(requester) else "好的，重新生成。这次会计入次数。"
         with contextlib.suppress(Exception):
             await event.edit(note, buttons=None)
-        _start_generation(message, **(offer.get("enqueue_kwargs") or {}))
+        kwargs = dict(offer.get("enqueue_kwargs") or {})
+        extra = [int(item) for item in (kwargs.get("cleanup_msg_ids") or []) if item]
+        if event.message_id:
+            extra.append(int(event.message_id))
+        kwargs["cleanup_msg_ids"] = extra
+        _start_generation(message, **kwargs)
 
     @mt_client.on(events.CallbackQuery(pattern=b"^ann:"))
     async def on_announce(event: events.CallbackQuery.Event) -> None:
@@ -3415,66 +3474,105 @@ async def poll() -> None:
     async def on_pack_offer(event: events.CallbackQuery.Event) -> None:
         await _handle_pack_callback(event)
 
-    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme|fwdgate):"))
+    @mt_client.on(events.CallbackQuery(pattern=b"^pick:"))
+    async def on_pick_lang(event: events.CallbackQuery.Event) -> None:
+        user_id = event.sender_id
+        chosen = lang_from_callback(event.data)
+        if user_id is None or chosen is None:
+            await event.answer(t(DEFAULT_LANG, "setting.bad"), alert=True)
+            return
+        await preferences.set_lang(user_id, chosen)
+        is_admin = access.is_admin(user_id)
+        await sync_user_commands(mt_client, user_id, chosen, is_admin=is_admin, ads_enabled=SHOW_AD_BUTTON)
+        welcome = t(chosen, "start.welcome") if access.is_allowed(user_id) else permission_message(user_id, chosen)
+        await event.answer(t(chosen, "pick.saved"))
+        with contextlib.suppress(Exception):
+            await event.edit(t(chosen, "pick.saved"), buttons=None)
+        await mt_client.send_message(
+            event.chat_id,
+            welcome,
+            buttons=main_menu(is_admin, chosen),
+        )
+
+    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme|fwdgate|lang):"))
     async def on_setting(event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id
+        lang = preferences.get_lang(user_id)
         if not access.is_allowed(user_id):
-            await event.answer("你没有使用权限。", alert=True)
+            await event.answer(t(lang, "perm.none"), alert=True)
             return
         if user_id is None:
-            await event.answer("设置参数无效。", alert=True)
+            await event.answer(t(lang, "setting.bad"), alert=True)
             return
         changed = False
         preset = preferences.get(user_id)
         delivery = preferences.get_delivery(user_id)
         theme = preferences.get_theme(user_id)
         admin_forward = forward.enabled if access.is_admin(user_id) and forward is not None else None
+        keyboard_lang = None
         if event.data.startswith(b"fwdgate:"):
             if not access.is_admin(user_id) or forward is None:
-                await event.answer("没有权限。", alert=True)
+                await event.answer(t(lang, "setting.no_right"), alert=True)
                 return
             await forward.set_enabled(not forward.enabled)
             admin_forward = forward.enabled
-            await event.answer("已打开" if forward.enabled else "已关闭")
+            await event.answer(t(lang, "fwdgate.opened") if forward.enabled else t(lang, "fwdgate.closed"))
             await event.edit(
-                setting_text(preset, delivery, theme),
-                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward),
+                setting_text(preset, delivery, theme, lang),
+                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, lang=lang),
             )
             return
-        if event.data.startswith(b"setting:"):
+        if event.data.startswith(b"lang:"):
+            selected_lang = lang_from_callback(event.data)
+            if selected_lang is None:
+                await event.answer(t(lang, "setting.bad"), alert=True)
+                return
+            changed = selected_lang != lang
+            lang = await preferences.set_lang(user_id, selected_lang)
+            keyboard_lang = lang if changed else None
+        elif event.data.startswith(b"setting:"):
             selected = setting_from_callback(event.data)
             if selected is None:
-                await event.answer("设置参数无效。", alert=True)
+                await event.answer(t(lang, "setting.bad"), alert=True)
                 return
             changed = selected != preset
             preset = await preferences.set(user_id, selected.count, selected.cols)
         elif event.data.startswith(b"theme:"):
             selected_theme = theme_from_callback(event.data)
             if selected_theme is None:
-                await event.answer("主题无效。", alert=True)
+                await event.answer(t(lang, "setting.bad_theme"), alert=True)
                 return
             changed = selected_theme != theme
             theme = await preferences.set_theme(user_id, selected_theme)
         else:
             selected_delivery = delivery_from_callback(event.data)
             if selected_delivery is None:
-                await event.answer("发送方式无效。", alert=True)
+                await event.answer(t(lang, "setting.bad_delivery"), alert=True)
                 return
             changed = selected_delivery != delivery
             delivery = await preferences.set_delivery(user_id, selected_delivery)
-        await event.answer("设置已保存。" if changed else "当前已是这个设置。")
+        await event.answer(t(lang, "setting.saved") if changed else t(lang, "setting.same"))
         if changed:
             await event.edit(
-                setting_text(preset, delivery, theme),
-                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward),
+                setting_text(preset, delivery, theme, lang),
+                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, lang=lang),
+            )
+        if keyboard_lang:
+            await sync_user_commands(
+                mt_client, user_id, keyboard_lang, is_admin=access.is_admin(user_id), ads_enabled=SHOW_AD_BUTTON,
+            )
+            await mt_client.send_message(
+                event.chat_id,
+                t(keyboard_lang, "lang.switched"),
+                buttons=main_menu(access.is_admin(user_id), keyboard_lang),
             )
 
     claim_task: asyncio.Task[None] | None = None
     try:
         await mt_client.start(bot_token=settings.bot_token)
-        await set_bot_commands(mt_client, settings.admin_ids, settings.ads_enabled)
+        await set_bot_commands(mt_client, settings.admin_ids, SHOW_AD_BUTTON)
         global _ads_enabled
-        _ads_enabled = settings.ads_enabled
+        _ads_enabled = SHOW_AD_BUTTON
         claim_task = asyncio.create_task(_claim_loop(mt_client, settings, task_log, access))
         tasks.add(claim_task)
         await media_server.start()
