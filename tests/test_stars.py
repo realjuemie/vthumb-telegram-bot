@@ -29,7 +29,7 @@ class StarsTests(unittest.TestCase):
         self.assertIsNone(precheck_error(b"s1", "XTR", 15, enabled=True))
         self.assertIsNotNone(precheck_error(b"s1", "XTR", 1, enabled=True))
 
-    def test_sponsor_is_spent_after_checkin_and_before_gift(self) -> None:
+    def test_gift_is_spent_before_sponsor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log = TaskLog(Path(directory) / "task_log.json", daily_limit=1)
             day = datetime(2026, 11, 22, 12, tzinfo=timezone(timedelta(hours=8)))
@@ -37,7 +37,7 @@ class StarsTests(unittest.TestCase):
             log.add_sponsor(7, 2)
             log.add_stored_many([7], 3)
             log.consume(7, day)
-            self.assertEqual(log.sponsor_credits(7), 1)
-            self.assertEqual(log.gift_credits(7), 3)
-            self.assertEqual(log.refund(7, day), "sponsor")
+            self.assertEqual(log.gift_credits(7), 2)
             self.assertEqual(log.sponsor_credits(7), 2)
+            self.assertEqual(log.refund(7, day), "gift")
+            self.assertEqual(log.gift_credits(7), 3)

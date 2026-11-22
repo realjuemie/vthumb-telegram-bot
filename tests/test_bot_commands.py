@@ -47,6 +47,16 @@ class BotCommandTests(unittest.TestCase):
         self.assertIn("✅ 授权用户", allowed)
         self.assertIn("使用次数：不限", allowed)
         self.assertEqual(command_name("/status"), "status")
+        from app.bot import Button, _button_style, inline_keyboard_payload
+        rows = [[
+            Button.inline("16x4", data=b"setting:16:4"),
+            Button.inline("文件发送", data=b"delivery:file"),
+            Button.inline("赞助支付：关", data=b"stargate:toggle"),
+        ]]
+        payload = inline_keyboard_payload(rows)
+        styles = [item.get("style") for item in payload["inline_keyboard"][0]]
+        self.assertEqual(styles, ["primary", "success", "danger"])
+        self.assertEqual(_button_style(b"theme:potplayer", "PotPlayer"), None)
 
     def test_extracts_addressed_command(self) -> None:
         self.assertEqual(command_name("/help@killfatsbot extra"), "help")

@@ -210,12 +210,12 @@ class TaskLog:
         elif entry["checkin_credits"] > 0:
             entry["checkin_credits"] -= 1
             bucket = "checkin"
-        elif entry["sponsor_credits"] > 0:
-            entry["sponsor_credits"] -= 1
-            bucket = "sponsor"
         elif entry["gift_credits"] > 0:
             entry["gift_credits"] -= 1
             bucket = "gift"
+        elif entry["sponsor_credits"] > 0:
+            entry["sponsor_credits"] -= 1
+            bucket = "sponsor"
         else:
             count += 1
             bucket = "daily"

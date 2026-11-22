@@ -65,8 +65,8 @@ _STRINGS: dict[str, dict[str, str]] = {
     "perm.none": {"zh": "你没有使用权限。", "en": "You don't have access."},
     "unknown_id": {"zh": "未知", "en": "unknown"},
     "quota.exhausted": {
-        "zh": "今天的免费保底已经用完，签到次数和系统赠送也没有了。\n发送 /checkin 每天可再获得 1 到 3 次签到次数。\n",
-        "en": "Today's free allowance is used up, and you have no check-in or gift credits.\n/checkin adds 1 to 3 check-in credits once a day.\n",
+        "zh": "今天的免费保底已经用完，签到、系统赠送和赞助次数也没有了。\n发送 /checkin 每天可再获得 1 到 3 次签到次数。\n",
+        "en": "Today's free allowance is used up, and you have no check-in, gift, or sponsorship credits.\n/checkin adds 1 to 3 check-in credits once a day.\n",
     },
     "quota.ad": {
         "zh": "看广告可获得 {reward} 次。点开广告后再点领取。\n",
@@ -198,8 +198,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "Send an integer from 1 to {max}, or tap another button to cancel.",
     },
     "bonus.done": {
-        "zh": "已给 {count} 个游客各增加 {amount} 次系统赠送。\n先扣每天的免费保底，再用签到次数，最后用系统赠送。\n只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。",
-        "en": "Added {amount} system-gift credits to each of {count} guests.\nFree allowance is spent first, then check-in credits, then gifts.\nOnly people who already chatted, have credits, or have settings. Later newcomers don't inherit this.",
+        "zh": "已给 {count} 个游客各增加 {amount} 次系统赠送。\n先扣每天的免费保底，再用签到次数，然后系统赠送，最后才用赞助次数。\n只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。",
+        "en": "Added {amount} system-gift credits to each of {count} guests.\nFree allowance is spent first, then check-in, then gifts, and sponsorship last.\nOnly people who already chatted, have credits, or have settings. Later newcomers don't inherit this.",
     },
     "unknown_command": {"zh": "未知命令，请使用 /help 查看可用命令。", "en": "Unknown command. Use /help."},
     "group.admin_only": {"zh": "此命令仅限管理员使用。", "en": "Admins only."},
@@ -288,8 +288,8 @@ _STRINGS: dict[str, dict[str, str]] = {
     "info.gift": {"zh": "系统赠送：{balance}", "en": "System gift: {balance}"},
     "info.sponsor": {"zh": "赞助次数：{balance}", "en": "Sponsorship credits: {balance}"},
     "info.spend_order": {
-        "zh": "先用每日免费保底，再用签到次数，再用赞助次数，最后用系统赠送。",
-        "en": "Free allowance first, then check-in, then sponsorship, then gifts.",
+        "zh": "先用每日免费保底，再用签到次数，再用系统赠送，最后用赞助次数。",
+        "en": "Free allowance first, then check-in, then gifts, then sponsorship.",
     },
     "info.unlimited": {"zh": "使用次数：不限", "en": "Uses: unlimited"},
     "info.unlimited_note": {

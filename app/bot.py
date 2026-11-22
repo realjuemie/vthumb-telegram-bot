@@ -860,6 +860,106 @@ def setting_buttons(
     return rows
 
 
+def _button_style(data: bytes, text: str) -> str | None:
+    """Telegram only allows primary (blue), success (green), and danger (red)."""
+    raw = data.decode("ascii", "replace")
+    if raw.startswith("setting:"):
+        return "primary"
+    if raw.startswith("delivery:"):
+        return "success"
+    if raw.startswith("lang:"):
+        return "success" if text.startswith("✓") else "primary"
+    if raw.startswith(("fwdgate:", "stargate:")):
+        if text.endswith("开") or text.lower().endswith("on"):
+            return "success"
+        return "danger"
+    return None
+
+
+def inline_keyboard_payload(rows) -> dict:
+    keyboard = []
+    for row in rows or []:
+        api_row = []
+        for button in row:
+            inner = getattr(button, "button", button)
+            data = getattr(inner, "data", b"") or b""
+            if isinstance(data, str):
+                data = data.encode()
+            text = getattr(inner, "text", "") or ""
+            item = {"text": text, "callback_data": data.decode("ascii", "replace")}
+            style = _button_style(data, text)
+            if style:
+                item["style"] = style
+            api_row.append(item)
+        if api_row:
+            keyboard.append(api_row)
+    return {"inline_keyboard": keyboard}
+
+
+async def _bot_api(method: str, payload: dict) -> bool:
+    """One Bot API call. True on success, including 'message is not modified'."""
+    if not _bot_token:
+        return False
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(payload).encode()
+    token = _bot_token
+
+    def _send() -> None:
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/{method}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+
+    try:
+        await asyncio.to_thread(_send)
+        return True
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.read().decode("utf-8", "replace")
+        if "message is not modified" in detail:
+            return True
+        logging.warning("Bot API %s failed (HTTP %s)", method, exc.code)
+        return False
+    except Exception as exc:
+        logging.warning("Bot API %s failed (%s)", method, type(exc).__name__)
+        return False
+
+
+async def show_colored_settings(chat_id: int, text: str, rows, *, message_id: int | None = None, reply_to: int | None = None) -> bool:
+    """Send or edit the settings keyboard in one call, colors included.
+
+    A Telethon edit cannot carry button color, so doing that first and painting
+    after makes every switch flash back to the default gray.
+    """
+    payload = {
+        "chat_id": int(chat_id),
+        "text": text,
+        "reply_markup": inline_keyboard_payload(rows),
+    }
+    if message_id:
+        payload["message_id"] = int(message_id)
+        return await _bot_api("editMessageText", payload)
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": int(reply_to)}
+    return await _bot_api("sendMessage", payload)
+
+
+async def paint_inline_styles(chat_id: int, message_id: int, rows) -> None:
+    if not rows or not message_id:
+        return
+    await _bot_api("editMessageReplyMarkup", {
+        "chat_id": int(chat_id),
+        "message_id": int(message_id),
+        "reply_markup": inline_keyboard_payload(rows),
+    })
+
+
 def setting_from_callback(data: bytes) -> ThumbnailPreset | None:
     try:
         prefix, count, cols = data.decode("ascii").split(":", 2)
@@ -1157,18 +1257,18 @@ async def handle_command(
         if _is_group_message(message):
             return True
         text = t(lang, "unknown_command")
-    await client.send_message(
+    if command == "setting" and buttons is not None and await show_colored_settings(
+        message.chat_id, text, buttons, reply_to=message.id,
+    ):
+        return True
+    sent = await client.send_message(
         message.chat_id,
         text,
         reply_to=message.id,
         buttons=_reply_menu(message, is_admin, buttons, lang),
     )
-    if command == "info" and stars_open() and _is_private_message(message) and not access.has_grant(user_id):
-        await client.send_message(
-            message.chat_id,
-            t(lang, "sponsor.pick"),
-            buttons=sponsor_pack_buttons(lang),
-        )
+    if command == "setting" and buttons is not None and getattr(sent, "id", None):
+        await paint_inline_styles(message.chat_id, sent.id, buttons)
     return True
 
 
@@ -3648,10 +3748,11 @@ async def poll() -> None:
             await forward.set_enabled(not forward.enabled)
             admin_forward = forward.enabled
             await event.answer(t(lang, "fwdgate.opened") if forward.enabled else t(lang, "fwdgate.closed"))
-            await event.edit(
-                setting_text(preset, delivery, theme, lang),
-                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, stars_enabled=_stars.enabled if access.is_admin(user_id) and _stars is not None else None, lang=lang),
-            )
+            rows = setting_buttons(preset, delivery, theme, admin_forward=admin_forward, stars_enabled=_stars.enabled if access.is_admin(user_id) and _stars is not None else None, lang=lang)
+            text = setting_text(preset, delivery, theme, lang)
+            if not await show_colored_settings(event.chat_id, text, rows, message_id=event.message_id):
+                await event.edit(text, buttons=rows)
+                await paint_inline_styles(event.chat_id, event.message_id, rows)
             return
         if event.data.startswith(b"stargate:"):
             if not access.is_admin(user_id) or _stars is None:
@@ -3659,17 +3760,18 @@ async def poll() -> None:
                 return
             await _stars.set_enabled(not _stars.enabled)
             await event.answer(t(lang, "stargate.opened") if _stars.enabled else t(lang, "stargate.closed"))
-            await event.edit(
-                setting_text(preset, delivery, theme, lang),
-                buttons=setting_buttons(
-                    preset,
-                    delivery,
-                    theme,
-                    admin_forward=admin_forward,
-                    stars_enabled=_stars.enabled,
-                    lang=lang,
-                ),
+            rows = setting_buttons(
+                preset,
+                delivery,
+                theme,
+                admin_forward=admin_forward,
+                stars_enabled=_stars.enabled,
+                lang=lang,
             )
+            text = setting_text(preset, delivery, theme, lang)
+            if not await show_colored_settings(event.chat_id, text, rows, message_id=event.message_id):
+                await event.edit(text, buttons=rows)
+                await paint_inline_styles(event.chat_id, event.message_id, rows)
             return
         if event.data.startswith(b"lang:"):
             selected_lang = lang_from_callback(event.data)
@@ -3702,10 +3804,11 @@ async def poll() -> None:
             delivery = await preferences.set_delivery(user_id, selected_delivery)
         await event.answer(t(lang, "setting.saved") if changed else t(lang, "setting.same"))
         if changed:
-            await event.edit(
-                setting_text(preset, delivery, theme, lang),
-                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, stars_enabled=_stars.enabled if access.is_admin(user_id) and _stars is not None else None, lang=lang),
-            )
+            rows = setting_buttons(preset, delivery, theme, admin_forward=admin_forward, stars_enabled=_stars.enabled if access.is_admin(user_id) and _stars is not None else None, lang=lang)
+            text = setting_text(preset, delivery, theme, lang)
+            if not await show_colored_settings(event.chat_id, text, rows, message_id=event.message_id):
+                await event.edit(text, buttons=rows)
+                await paint_inline_styles(event.chat_id, event.message_id, rows)
         if keyboard_lang:
             await sync_user_commands(
                 mt_client, user_id, keyboard_lang, is_admin=access.is_admin(user_id), ads_enabled=SHOW_AD_BUTTON,
