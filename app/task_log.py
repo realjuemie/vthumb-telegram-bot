@@ -118,6 +118,39 @@ class TaskLog:
                 found.add(user_id)
         return found
 
+    def _normalize(self, entry: dict | None) -> dict:
+        entry = dict(entry or {})
+        if "checkin_credits" not in entry and "gift_credits" not in entry:
+            try:
+                legacy = max(0, int(entry.pop("stored", 0) or 0))
+            except (TypeError, ValueError):
+                legacy = 0
+                entry.pop("stored", None)
+            # The old pool mixed check-in and admin grants. The live totals are
+            # mostly grants, so the unsplit remainder is shown as a system gift.
+            entry["checkin_credits"] = 0
+            entry["gift_credits"] = legacy
+        else:
+            entry.pop("stored", None)
+            for field in ("checkin_credits", "gift_credits"):
+                try:
+                    entry[field] = max(0, int(entry.get(field) or 0))
+                except (TypeError, ValueError):
+                    entry[field] = 0
+        try:
+            entry["sponsor_credits"] = max(0, int(entry.get("sponsor_credits") or 0))
+        except (TypeError, ValueError):
+            entry["sponsor_credits"] = 0
+        stack = entry.get("spend")
+        if not isinstance(stack, list):
+            entry["spend"] = []
+        else:
+            entry["spend"] = [item for item in stack if item in {"daily", "checkin", "sponsor", "gift"}][-32:]
+        return entry
+
+    def _get(self, user_id: int) -> dict:
+        return self._normalize(self.quota.get(str(user_id)) or {})
+
     def used_today(self, user_id: int, now: datetime | None = None) -> int:
         entry = self.quota.get(str(user_id)) or {}
         if entry.get("date") != today_key(now):
@@ -127,12 +160,18 @@ class TaskLog:
         except (TypeError, ValueError):
             return 0
 
+    def checkin_credits(self, user_id: int) -> int:
+        return self._get(user_id)["checkin_credits"]
+
+    def gift_credits(self, user_id: int) -> int:
+        return self._get(user_id)["gift_credits"]
+
+    def sponsor_credits(self, user_id: int) -> int:
+        return self._get(user_id)["sponsor_credits"]
+
     def stored_credits(self, user_id: int) -> int:
-        entry = self.quota.get(str(user_id)) or {}
-        try:
-            return max(0, int(entry.get("stored") or 0))
-        except (TypeError, ValueError):
-            return 0
+        entry = self._get(user_id)
+        return entry["checkin_credits"] + entry["gift_credits"] + entry["sponsor_credits"]
 
     def checked_in_on(self, user_id: int, now: datetime | None = None) -> bool:
         entry = self.quota.get(str(user_id)) or {}
@@ -147,16 +186,15 @@ class TaskLog:
             raise ValueError("check-in reward must be from 1 to 3")
         key = str(user_id)
         day = today_key(now)
-        entry = dict(self.quota.get(key) or {})
+        entry = self._get(user_id)
         if entry.get("date") != day:
             entry["date"] = day
             entry["count"] = 0
-        stored = max(0, int(entry.get("stored") or 0)) + gained
-        entry["stored"] = stored
+        entry["checkin_credits"] = entry["checkin_credits"] + gained
         entry["checkin"] = day
         self.quota[key] = entry
         self._save()
-        return gained, stored
+        return gained, entry["checkin_credits"]
 
     def can_generate(self, user_id: int, now: datetime | None = None) -> bool:
         return self.used_today(user_id, now) < self.daily_limit or self.stored_credits(user_id) > 0
@@ -164,61 +202,93 @@ class TaskLog:
     def consume(self, user_id: int, now: datetime | None = None) -> int:
         key = str(user_id)
         day = today_key(now)
-        entry = dict(self.quota.get(key) or {})
+        entry = self._get(user_id)
         count = int(entry.get("count") or 0) if entry.get("date") == day else 0
-        stored = max(0, int(entry.get("stored") or 0))
         if count < self.daily_limit:
             count += 1
-        elif stored > 0:
-            stored -= 1
+            bucket = "daily"
+        elif entry["checkin_credits"] > 0:
+            entry["checkin_credits"] -= 1
+            bucket = "checkin"
+        elif entry["sponsor_credits"] > 0:
+            entry["sponsor_credits"] -= 1
+            bucket = "sponsor"
+        elif entry["gift_credits"] > 0:
+            entry["gift_credits"] -= 1
+            bucket = "gift"
         else:
             count += 1
+            bucket = "daily"
         entry["date"] = day
         entry["count"] = count
-        entry["stored"] = stored
-        if "checkin" not in entry and (self.quota.get(key) or {}).get("checkin"):
-            entry["checkin"] = self.quota[key].get("checkin")
+        stack = list(entry.get("spend") or [])
+        stack.append(bucket)
+        entry["spend"] = stack[-32:]
         self.quota[key] = entry
         self._save()
         return count
 
-    def refund(self, user_id: int, now: datetime | None = None) -> bool:
-        """Give back one slot taken by `consume`, for a job that produced nothing.
-
-        `consume` spends today's allowance first and a stored credit only once
-        that is used up, and the ledger does not record which one it took. Both
-        are worth one generation, so returning a slot to whichever counter is
-        non-zero restores the user's position without over-granting.
-        """
-        key = str(user_id)
-        day = today_key(now)
-        entry = dict(self.quota.get(key) or {})
-        if entry.get("date") != day:
-            return False
-        count = int(entry.get("count") or 0)
-        stored = max(0, int(entry.get("stored") or 0))
-        if count > 0:
-            count -= 1
-        elif stored > 0:
-            stored += 1
-        else:
-            return False
-        entry["count"] = count
-        entry["stored"] = stored
+    def add_sponsor(self, user_id: int, amount: int) -> int:
+        if amount < 1:
+            raise ValueError("amount must be positive")
+        key = str(int(user_id))
+        entry = self._get(int(user_id))
+        entry["sponsor_credits"] = entry["sponsor_credits"] + int(amount)
         self.quota[key] = entry
         self._save()
-        return True
+        return entry["sponsor_credits"]
+
+    def remove_sponsor(self, user_id: int, amount: int) -> int:
+        key = str(int(user_id))
+        entry = self._get(int(user_id))
+        entry["sponsor_credits"] = max(0, entry["sponsor_credits"] - int(amount))
+        self.quota[key] = entry
+        self._save()
+        return entry["sponsor_credits"]
+
+    def refund(self, user_id: int, now: datetime | None = None) -> str | None:
+        """Give back the last slot taken by `consume`, for a job that produced nothing."""
+        key = str(user_id)
+        day = today_key(now)
+        entry = self._get(user_id)
+        stack = list(entry.get("spend") or [])
+        bucket = stack[-1] if stack else None
+        if bucket == "daily":
+            if entry.get("date") != day or int(entry.get("count") or 0) <= 0:
+                return None
+            entry["count"] = int(entry.get("count") or 0) - 1
+            stack.pop()
+        elif bucket == "checkin":
+            entry["checkin_credits"] += 1
+            stack.pop()
+        elif bucket == "sponsor":
+            entry["sponsor_credits"] += 1
+            stack.pop()
+        elif bucket == "gift":
+            entry["gift_credits"] += 1
+            stack.pop()
+        elif entry.get("date") == day and int(entry.get("count") or 0) > 0:
+            entry["count"] = int(entry.get("count") or 0) - 1
+            bucket = "daily"
+        elif entry.get("date") == day:
+            entry["gift_credits"] += 1
+            bucket = "gift"
+        else:
+            return None
+        entry["spend"] = stack
+        self.quota[key] = entry
+        self._save()
+        return bucket
 
     def add_stored_many(self, user_ids, amount: int) -> int:
-        """Add persistent credits. Does not touch today's daily count."""
+        """Add system-gift credits. Does not touch today's free allowance or check-in."""
         if amount < 1:
             raise ValueError("amount must be positive")
         count = 0
         for user_id in user_ids:
             key = str(int(user_id))
-            entry = dict(self.quota.get(key) or {})
-            stored = max(0, int(entry.get("stored") or 0)) + int(amount)
-            entry["stored"] = stored
+            entry = self._get(int(user_id))
+            entry["gift_credits"] = entry["gift_credits"] + int(amount)
             self.quota[key] = entry
             count += 1
         if count:

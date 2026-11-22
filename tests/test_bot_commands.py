@@ -29,13 +29,23 @@ from app.bot import (
 class BotCommandTests(unittest.TestCase):
     def test_info_shows_guest_remaining_and_grant(self) -> None:
         sender = type("U", (), {"username": "ada", "first_name": "Ada", "last_name": None})()
-        guest = account_info_text(sender, 7, granted=False, is_admin=False, used=3, limit=10)
-        self.assertIn("授权用户：否", guest)
-        self.assertIn("今日剩余次数：7/10", guest)
+        guest = account_info_text(
+            sender, 7, granted=False, is_admin=False, used=3, limit=10, checkin=2, gift=5, checked_in=True,
+        )
+        self.assertIn("✅ 游客", guest)
+        self.assertIn("每日免费保底：7/10", guest)
+        self.assertIn("每日签到：2（今天已签到）", guest)
+        self.assertIn("系统赠送：5", guest)
+        self.assertIn("赞助次数：0", guest)
         self.assertIn("@ada", guest)
+        self.assertNotIn("储存次数", guest)
         admin = account_info_text(sender, 1, granted=True, is_admin=True, used=9, limit=10)
-        self.assertIn("授权用户：是（管理员）", admin)
-        self.assertIn("今日剩余次数：不限", admin)
+        self.assertIn("✅ 管理员", admin)
+        self.assertIn("使用次数：不限", admin)
+        self.assertNotIn("每日免费保底：", admin)
+        allowed = account_info_text(sender, 2, granted=True, is_admin=False, used=1, limit=10)
+        self.assertIn("✅ 授权用户", allowed)
+        self.assertIn("使用次数：不限", allowed)
         self.assertEqual(command_name("/status"), "status")
 
     def test_extracts_addressed_command(self) -> None:

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
@@ -51,12 +52,16 @@ class TaskLogTests(unittest.TestCase):
             self.assertTrue(log.can_generate(7, day))
             log.consume(7, day)
             self.assertEqual(log.stored_credits(7), 1)
+            self.assertEqual(log.checkin_credits(7), 1)
+            self.assertEqual(log.gift_credits(7), 0)
             with self.assertRaises(ValueError):
                 log.check_in(8, day, roll=lambda _a, _b: 4)
             self.assertEqual(log.used_today(7, day), 10)
             added = log.add_stored_many([7, 8], 5)
             self.assertEqual(added, 2)
             self.assertEqual(log.stored_credits(7), 6)
+            self.assertEqual(log.checkin_credits(7), 1)
+            self.assertEqual(log.gift_credits(7), 5)
             self.assertEqual(log.used_today(7, day), 10)
             self.assertEqual(log.stored_credits(8), 5)
             reloaded = TaskLog(Path(directory) / "task_log.json", daily_limit=10)
@@ -64,6 +69,20 @@ class TaskLogTests(unittest.TestCase):
             self.assertEqual(file_key(_Msg(42)), "42")
             self.assertIsNone(file_key(_Msg(None)))
             self.assertEqual(today_key(day), "2026-10-15")
+
+    def test_legacy_stored_is_shown_as_gift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "task_log.json"
+            path.write_text(
+                json.dumps({"files": {}, "quota": {"7": {"stored": 20}}}),
+                encoding="utf-8",
+            )
+            log = TaskLog(path, daily_limit=10)
+            self.assertEqual(log.gift_credits(7), 20)
+            self.assertEqual(log.checkin_credits(7), 0)
+            log.check_in(7, datetime(2026, 10, 15, 12, tzinfo=timezone(timedelta(hours=8))), roll=lambda _a, _b: 2)
+            self.assertEqual(log.checkin_credits(7), 2)
+            self.assertEqual(log.gift_credits(7), 20)
 
     def test_other_user_matches_by_name_and_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -27,6 +27,7 @@ from .flood_gate import FloodGate, describe_wait, resume_clock
 from .mtproto_range import FetchBudgetExceeded, MTProtoRangeServer
 from .remux import evaluate_copy_remux, probe_streams, remux_copy_mp4
 from .settings import Settings
+from .stars import PACKS, StarsGate, StarsLedger, precheck_error, refund_charge, send_pack_invoice
 from .task_log import TaskLog, content_key, file_key
 from .user_preferences import (
     DELIVERY_FILE,
@@ -184,6 +185,8 @@ def quota_message(limit: int, community_url: str, ad_reward: int = 5, ads_enable
 
 _audience: Audience | None = None
 _preferences: UserPreferences | None = None
+_stars: StarsGate | None = None
+_star_ledger: StarsLedger | None = None
 _announce_wait: set[int] = set()
 _bonus_wait: set[int] = set()
 _announce_drafts: dict[str, dict] = {}
@@ -194,10 +197,76 @@ ANNOUNCE_HINT = t(LANG_ZH, "announce.hint")
 SHOW_AD_BUTTON = False
 
 
+def stars_open() -> bool:
+    return _stars is not None and _stars.enabled
+
+
+def sponsor_pack_buttons(lang: str | None):
+    rows = []
+    for pack_id, pack in PACKS.items():
+        rows.append([
+            Button.inline(
+                t(lang, "sponsor.pack", stars=pack["stars"], credits=pack["credits"]),
+                data=f"star:{pack_id}".encode("ascii"),
+            )
+        ])
+    return rows
+
+
 def user_lang(user_id: int | None) -> str:
     if _preferences is None or user_id is None:
         return DEFAULT_LANG
     return _preferences.get_lang(user_id)
+
+
+async def _offer_sponsor(client, access, guest_gate, message, lang, user_id) -> None:
+    if not _is_private_message(message):
+        await client.send_message(message.chat_id, t(lang, "sponsor.private"), reply_to=message.id)
+        return
+    if not stars_open():
+        await client.send_message(message.chat_id, t(lang, "sponsor.off"), reply_to=message.id, buttons=main_menu(access.is_admin(user_id), lang))
+        return
+    if user_id is None or access.has_grant(user_id) or access.is_admin(user_id):
+        await client.send_message(message.chat_id, t(lang, "sponsor.unlimited"), reply_to=message.id, buttons=main_menu(access.is_admin(user_id), lang))
+        return
+    if guests_closed(access, guest_gate, user_id):
+        await client.send_message(message.chat_id, t(lang, "sponsor.closed_guest"), reply_to=message.id, buttons=main_menu(False, lang))
+        return
+    await client.send_message(message.chat_id, t(lang, "sponsor.pick"), reply_to=message.id, buttons=sponsor_pack_buttons(lang))
+
+
+async def _credit_star_payment(client, message, task_log: TaskLog) -> None:
+    action = getattr(message, "action", None)
+    if not isinstance(action, types.MessageActionPaymentSentMe) or _star_ledger is None:
+        return
+    found = None
+    payload = getattr(action, "payload", b"")
+    from .stars import pack_from_payload
+    found = pack_from_payload(payload)
+    if found is None or getattr(action, "currency", "") != "XTR":
+        return
+    pack_id, pack = found
+    if int(getattr(action, "total_amount", 0) or 0) != pack["stars"]:
+        return
+    charge = getattr(action, "charge", None)
+    charge_id = getattr(charge, "id", None)
+    user_id = getattr(message, "sender_id", None)
+    if not charge_id or not user_id:
+        logging.warning("star payment missing charge or sender")
+        return
+    if not _star_ledger.grant(str(charge_id), int(user_id), pack_id, pack["stars"], pack["credits"]):
+        return
+    balance = task_log.add_sponsor(int(user_id), pack["credits"])
+    lang = user_lang(int(user_id))
+    token = _star_ledger.token_for(str(charge_id))
+    buttons = None
+    if token:
+        buttons = [[Button.inline(t(lang, "sponsor.refund"), data=f"sref:{token}".encode("ascii"))]]
+    await client.send_message(
+        int(user_id),
+        t(lang, "sponsor.paid", credits=pack["credits"], balance=balance),
+        buttons=buttons,
+    )
 
 
 async def _show_announce_preview(client: TelegramClient, admin_id: int, chat_id: int, text: str, reply_to: int) -> None:
@@ -323,7 +392,7 @@ _ads_enabled = False
 
 def menu_rows(is_admin: bool, ads_enabled: bool | None = None, lang: str | None = None) -> tuple[tuple[str, ...], ...]:
     enabled = _ads_enabled if ads_enabled is None else ads_enabled
-    return localized_menu_rows(is_admin, lang, ads_enabled=enabled)
+    return localized_menu_rows(is_admin, lang, ads_enabled=enabled, stars_enabled=stars_open())
 
 
 def menu_action(text: str | None) -> str | None:
@@ -742,6 +811,7 @@ def setting_buttons(
     delivery: str,
     theme: str,
     admin_forward: bool | None = None,
+    stars_enabled: bool | None = None,
     lang: str | None = None,
 ) -> list[list[Button]]:
     code = normalize_lang(lang)
@@ -784,6 +854,9 @@ def setting_buttons(
     if admin_forward is not None:
         label = t(code, "fwdgate.on") if admin_forward else t(code, "fwdgate.off")
         rows.append([Button.inline(label, data=b"fwdgate:toggle")])
+    if stars_enabled is not None:
+        label = t(code, "stargate.on") if stars_enabled else t(code, "stargate.off")
+        rows.append([Button.inline(label, data=b"stargate:toggle")])
     return rows
 
 
@@ -935,7 +1008,10 @@ async def handle_command(
             is_admin=is_admin,
             used=used,
             limit=limit,
-            stored=task_log.stored_credits(user_id) if task_log is not None and user_id is not None else 0,
+            checkin=task_log.checkin_credits(user_id) if task_log is not None and user_id is not None else 0,
+            gift=task_log.gift_credits(user_id) if task_log is not None and user_id is not None else 0,
+            sponsor=task_log.sponsor_credits(user_id) if task_log is not None and user_id is not None else 0,
+            checked_in=task_log.checked_in_on(user_id) if task_log is not None and user_id is not None else False,
             guest_open=not guests_closed(access, guest_gate, user_id),
             lang=lang,
         )
@@ -947,7 +1023,7 @@ async def handle_command(
         else:
             result = task_log.check_in(user_id)
             if result is None:
-                text = t(lang, "checkin.already", stored=task_log.stored_credits(user_id))
+                text = t(lang, "checkin.already", stored=task_log.checkin_credits(user_id))
             else:
                 gained, total = result
                 text = t(lang, "checkin.ok", gained=gained, total=total, limit=settings.guest_daily_limit)
@@ -997,6 +1073,7 @@ async def handle_command(
                 delivery,
                 theme,
                 admin_forward=forward.enabled if is_admin and forward is not None else None,
+                stars_enabled=_stars.enabled if is_admin and _stars is not None else None,
                 lang=lang,
             )
     elif command in {"add", "del", "users"}:
@@ -1067,6 +1144,9 @@ async def handle_command(
         else:
             await _begin_announce(client, message)
             return True
+    elif command == "sponsor":
+        await _offer_sponsor(client, access, guest_gate, message, lang, user_id)
+        return True
     elif command == "group":
         await _handle_group_command(client, access, groups, message)
         return True
@@ -1083,6 +1163,12 @@ async def handle_command(
         reply_to=message.id,
         buttons=_reply_menu(message, is_admin, buttons, lang),
     )
+    if command == "info" and stars_open() and _is_private_message(message) and not access.has_grant(user_id):
+        await client.send_message(
+            message.chat_id,
+            t(lang, "sponsor.pick"),
+            buttons=sponsor_pack_buttons(lang),
+        )
     return True
 
 
@@ -1566,10 +1652,15 @@ def account_info_text(
     is_admin: bool,
     used: int,
     limit: int,
-    stored: int = 0,
+    checkin: int = 0,
+    gift: int = 0,
+    sponsor: int = 0,
+    checked_in: bool = False,
     guest_open: bool = True,
     lang: str | None = None,
+    stored: int = 0,
 ) -> str:
+    del stored
     name = ""
     username = None
     if sender is not None:
@@ -1577,23 +1668,49 @@ def account_info_text(
         first = (getattr(sender, "first_name", None) or "").strip()
         last = (getattr(sender, "last_name", None) or "").strip()
         name = " ".join(part for part in (first, last) if part)
+    if is_admin:
+        guest_line, grant_line, admin_line = (
+            t(lang, "info.role_guest"),
+            t(lang, "info.role_grant"),
+            t(lang, "info.role_admin_current"),
+        )
+    elif granted:
+        guest_line, grant_line, admin_line = (
+            t(lang, "info.role_guest"),
+            t(lang, "info.role_grant_current"),
+            t(lang, "info.role_admin"),
+        )
+    else:
+        guest_line, grant_line, admin_line = (
+            t(lang, "info.role_guest_current"),
+            t(lang, "info.role_grant"),
+            t(lang, "info.role_admin"),
+        )
     lines = [
         t(lang, "info.title"),
+        "",
         t(lang, "info.name", name=name or t(lang, "info.unset")),
         t(lang, "info.username", name=f"@{username}") if username else t(lang, "info.no_username"),
         t(lang, "info.id", user_id=user_id or t(lang, "unknown_id")),
+        "",
+        t(lang, "info.groups"),
+        guest_line,
+        grant_line,
+        admin_line,
+        "",
+        t(lang, "info.credits"),
     ]
-    if is_admin:
-        lines.append(t(lang, "info.grant_admin"))
+    if is_admin or granted:
         lines.append(t(lang, "info.unlimited"))
-    elif granted:
-        lines.append(t(lang, "info.grant_yes"))
-        lines.append(t(lang, "info.unlimited"))
+        lines.append(t(lang, "info.unlimited_note"))
     else:
         remaining = max(int(limit) - int(used), 0)
-        lines.append(t(lang, "info.grant_no"))
-        lines.append(t(lang, "info.remaining", remaining=remaining, limit=limit))
-        lines.append(t(lang, "info.stored", stored=stored))
+        status = t(lang, "info.checked") if checked_in else t(lang, "info.not_checked")
+        lines.append(t(lang, "info.daily", remaining=remaining, limit=limit))
+        lines.append(t(lang, "info.checkin", balance=checkin, status=status))
+        lines.append(t(lang, "info.gift", balance=gift))
+        lines.append(t(lang, "info.sponsor", balance=sponsor))
+        lines.append(t(lang, "info.spend_order"))
         lines.append(t(lang, "info.reuse_note"))
         if not guest_open:
             lines.append(t(lang, "info.closed"))
@@ -2330,12 +2447,12 @@ async def _claim_loop(client: TelegramClient, settings: Settings, task_log: Task
             user_ids = await asyncio.to_thread(consume_claims, path, state, int(time.time()))
             for user_id in user_ids:
                 task_log.add_stored_many([user_id], settings.ad_reward)
-                total = task_log.stored_credits(user_id)
+                total = task_log.gift_credits(user_id)
                 try:
                     await client.send_message(
                         user_id,
-                        f"看广告到账，获得 {settings.ad_reward} 次。储存次数：{total}",
-                        buttons=main_menu(access.is_admin(user_id)),
+                        t(user_lang(user_id), "ad.credited", reward=settings.ad_reward, total=total),
+                        buttons=main_menu(access.is_admin(user_id), user_lang(user_id)),
                     )
                 except Exception:
                     logging.info("Could not notify ad reward for %s", user_id)
@@ -3114,7 +3231,9 @@ async def process_message(
                         and access is not None
                         and not access.has_grant(payer)
                     ):
-                        task_log.refund(payer)
+                        restored = task_log.refund(payer)
+                        if restored == "sponsor" and _star_ledger is not None:
+                            _star_ledger.note_unspend(payer, 1)
                 else:
                     error_text = t(sheet_lang, "error.prefix") + user_error_message(exc, sheet_lang)
                 if progress:
@@ -3173,6 +3292,9 @@ async def poll() -> None:
     queue = JobQueue(settings.max_concurrent_jobs)
     forward = ForwardGate(Path(settings.access_file).with_name("forward.json"))
     guest_gate = GuestGate(Path(settings.access_file).with_name("guest.json"))
+    global _stars, _star_ledger
+    _stars = StarsGate(Path(settings.access_file).with_name("stars_gate.json"))
+    _star_ledger = StarsLedger(Path(settings.access_file).with_name("stars_payments.json"))
     task_log = TaskLog(
         Path(settings.access_file).with_name("task_log.json"),
         daily_limit=settings.guest_daily_limit,
@@ -3226,6 +3348,9 @@ async def poll() -> None:
             return
         if user_id is not None and not access.has_grant(user_id):
             task_log.consume(user_id)
+            spent = (task_log._get(user_id).get("spend") or [None])[-1]
+            if spent == "sponsor" and _star_ledger is not None:
+                _star_ledger.note_spend(user_id, 1)
         task = asyncio.create_task(
             process_message(
                 mt_client, media_server, settings, preferences, queue, message,
@@ -3246,6 +3371,9 @@ async def poll() -> None:
 
     @mt_client.on(events.NewMessage(incoming=True))
     async def on_message(event: events.NewMessage.Event) -> None:
+        if isinstance(getattr(event.message, "action", None), types.MessageActionPaymentSentMe):
+            await _credit_star_payment(mt_client, event.message, task_log)
+            return
         sender = private_sender_id(bool(event.is_private), event.sender_id)
         if sender and _audience is not None:
             _audience.note(sender)
@@ -3284,15 +3412,12 @@ async def poll() -> None:
                 _bonus_wait.discard(event.sender_id)
                 targets = ungranted_user_ids(access, task_log, preferences)
                 count = task_log.add_stored_many(targets, amount)
+                lang = preferences.get_lang(event.sender_id)
                 await mt_client.send_message(
                     event.chat_id,
-                    (
-                        f"已给 {count} 个非授权用户各增加 {amount} 次储存次数。\n"
-                        "这些次数不占每天的 10 次，每天的额度用完后才会扣。\n"
-                        "只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。"
-                    ),
+                    t(lang, "bonus.done", count=count, amount=amount),
                     reply_to=event.message.id,
-                    buttons=main_menu(True),
+                    buttons=main_menu(True, lang),
                 )
                 return
         if event.sender_id in _announce_wait:
@@ -3351,6 +3476,12 @@ async def poll() -> None:
                 reply_to=event.message.id,
                 buttons=main_menu(access.is_admin(event.sender_id)) if event.is_private else None,
             )
+            if stars_open() and event.is_private and not access.has_grant(event.sender_id):
+                await mt_client.send_message(
+                    event.chat_id,
+                    t(preferences.get_lang(event.sender_id), "sponsor.pick"),
+                    buttons=sponsor_pack_buttons(preferences.get_lang(event.sender_id)),
+                )
             return
         _start_generation(event.message)
 
@@ -3405,7 +3536,7 @@ async def poll() -> None:
             with contextlib.suppress(Exception):
                 await event.edit(
                     quota_message(settings.guest_daily_limit, settings.community_url, settings.ad_reward, settings.ads_live and SHOW_AD_BUTTON),
-                    buttons=None,
+                    buttons=sponsor_pack_buttons(user_lang(requester)) if stars_open() and not access.has_grant(requester) else None,
                 )
             return
         _drop_reuse_offer(token)
@@ -3494,7 +3625,7 @@ async def poll() -> None:
             buttons=main_menu(is_admin, chosen),
         )
 
-    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme|fwdgate|lang):"))
+    @mt_client.on(events.CallbackQuery(pattern=b"^(setting|delivery|theme|fwdgate|lang|stargate):"))
     async def on_setting(event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id
         lang = preferences.get_lang(user_id)
@@ -3519,7 +3650,25 @@ async def poll() -> None:
             await event.answer(t(lang, "fwdgate.opened") if forward.enabled else t(lang, "fwdgate.closed"))
             await event.edit(
                 setting_text(preset, delivery, theme, lang),
-                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, lang=lang),
+                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, stars_enabled=_stars.enabled if access.is_admin(user_id) and _stars is not None else None, lang=lang),
+            )
+            return
+        if event.data.startswith(b"stargate:"):
+            if not access.is_admin(user_id) or _stars is None:
+                await event.answer(t(lang, "setting.no_right"), alert=True)
+                return
+            await _stars.set_enabled(not _stars.enabled)
+            await event.answer(t(lang, "stargate.opened") if _stars.enabled else t(lang, "stargate.closed"))
+            await event.edit(
+                setting_text(preset, delivery, theme, lang),
+                buttons=setting_buttons(
+                    preset,
+                    delivery,
+                    theme,
+                    admin_forward=admin_forward,
+                    stars_enabled=_stars.enabled,
+                    lang=lang,
+                ),
             )
             return
         if event.data.startswith(b"lang:"):
@@ -3555,7 +3704,7 @@ async def poll() -> None:
         if changed:
             await event.edit(
                 setting_text(preset, delivery, theme, lang),
-                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, lang=lang),
+                buttons=setting_buttons(preset, delivery, theme, admin_forward=admin_forward, stars_enabled=_stars.enabled if access.is_admin(user_id) and _stars is not None else None, lang=lang),
             )
         if keyboard_lang:
             await sync_user_commands(
@@ -3566,6 +3715,83 @@ async def poll() -> None:
                 t(keyboard_lang, "lang.switched"),
                 buttons=main_menu(access.is_admin(user_id), keyboard_lang),
             )
+
+    @mt_client.on(events.CallbackQuery(pattern=b"^star:"))
+    async def on_star_buy(event: events.CallbackQuery.Event) -> None:
+        lang = preferences.get_lang(event.sender_id)
+        raw = (event.data or b"").decode("ascii", "replace")
+        pack_id = raw.split(":", 1)[1] if ":" in raw else ""
+        if not event.is_private:
+            await event.answer(t(lang, "sponsor.private"), alert=True)
+            return
+        if pack_id not in PACKS:
+            await event.answer(t(lang, "sponsor.off"), alert=True)
+            return
+        if not stars_open():
+            await event.answer(t(lang, "sponsor.off"), alert=True)
+            return
+        if access.has_grant(event.sender_id) or access.is_admin(event.sender_id):
+            await event.answer(t(lang, "sponsor.unlimited"), alert=True)
+            return
+        if guests_closed(access, guest_gate, event.sender_id):
+            await event.answer(t(lang, "sponsor.closed_guest"), alert=True)
+            return
+        await event.answer()
+        pack = PACKS[pack_id]
+        title = t(lang, "sponsor.pack", stars=pack["stars"], credits=pack["credits"])
+        try:
+            await send_pack_invoice(mt_client, event.sender_id, pack_id, title, t(lang, "sponsor.pick"))
+        except Exception as exc:
+            logging.warning("star invoice failed (%s)", type(exc).__name__)
+            await mt_client.send_message(event.chat_id, t(lang, "sponsor.refund_fail"))
+
+    @mt_client.on(events.CallbackQuery(pattern=b"^sref:"))
+    async def on_star_refund(event: events.CallbackQuery.Event) -> None:
+        lang = user_lang(event.sender_id)
+        token = (event.data or b"").decode("ascii", "replace").split(":", 1)[-1]
+        found = _star_ledger.by_token(token) if _star_ledger is not None else None
+        if found is None or int(found[1].get("user_id") or 0) != int(event.sender_id or 0):
+            await event.answer(t(lang, "pack.not_yours"), alert=True)
+            return
+        charge_id, item = found
+        if not _star_ledger.can_refund(charge_id, event.sender_id):
+            await event.answer(t(lang, "sponsor.used"), alert=True)
+            return
+        try:
+            await refund_charge(mt_client, event.sender_id, charge_id)
+        except Exception as exc:
+            logging.warning("star refund failed (%s)", type(exc).__name__)
+            await event.answer(t(lang, "sponsor.refund_fail"), alert=True)
+            return
+        marked = _star_ledger.mark_refunded(charge_id)
+        if marked is not None:
+            task_log.remove_sponsor(event.sender_id, int(marked.get("credits") or 0))
+        await event.answer(t(lang, "sponsor.refunded", stars=item.get("stars"), credits=item.get("credits")))
+        with contextlib.suppress(Exception):
+            await event.edit(t(lang, "sponsor.refunded", stars=item.get("stars"), credits=item.get("credits")), buttons=None)
+
+    @mt_client.on(events.Raw)
+    async def on_star_precheckout(update) -> None:
+        if not isinstance(update, types.UpdateBotPrecheckoutQuery):
+            return
+        error = precheck_error(
+            update.payload,
+            update.currency,
+            update.total_amount,
+            enabled=stars_open(),
+        )
+        await mt_client(
+            functions.messages.SetBotPrecheckoutResultsRequest(
+                query_id=update.query_id,
+                success=error is None,
+                error=error,
+            )
+        )
+
+    @mt_client.on(events.NewMessage)
+    async def on_star_paid(event: events.NewMessage.Event) -> None:
+        if isinstance(getattr(event.message, "action", None), types.MessageActionPaymentSentMe):
+            await _credit_star_payment(mt_client, event.message, task_log)
 
     claim_task: asyncio.Task[None] | None = None
     try:

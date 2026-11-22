@@ -26,16 +26,16 @@ _STRINGS: dict[str, dict[str, str]] = {
     "cmd.status": {"zh": "查看缩略图设置和读取预算", "en": "Thumbnail settings and read budget"},
     "cmd.setting": {"zh": "选择每个用户独立的缩略图预设", "en": "Choose your own thumbnail preset"},
     "cmd.id": {"zh": "查看自己的 Telegram 用户 ID", "en": "Show your Telegram user ID"},
-    "cmd.info": {"zh": "查看账号、授权状态和今日剩余次数", "en": "Account, access, and uses left today"},
-    "cmd.checkin": {"zh": "每日签到，获得 1 到 3 次储存次数", "en": "Daily check-in for 1 to 3 stored credits"},
-    "cmd.ad": {"zh": "看广告，获得 5 次储存次数", "en": "Watch an ad for stored credits"},
+    "cmd.info": {"zh": "查看身份、用户组和次数", "en": "Identity, group, and credits"},
+    "cmd.checkin": {"zh": "每日签到，获得 1 到 3 次签到次数", "en": "Daily check-in for 1 to 3 check-in credits"},
+    "cmd.ad": {"zh": "看广告，获得系统赠送次数", "en": "Watch an ad for system-gift credits"},
     "cmd.merge": {"zh": "合并接下来 N 条媒体 (默认 2)，图片在前视频在后", "en": "Merge the next N media (default 2)"},
     "cmd.thumb": {"zh": "回复一条视频，生成缩略图", "en": "Reply to a video to make a sheet"},
     "cmd.add": {"zh": "管理员：添加授权用户", "en": "Admin: allow a user"},
     "cmd.del": {"zh": "管理员：删除授权用户", "en": "Admin: remove a user"},
     "cmd.users": {"zh": "管理员：查看授权用户", "en": "Admin: list allowed users"},
     "cmd.guest": {"zh": "管理员：开关非授权用户使用", "en": "Admin: toggle guest access"},
-    "cmd.bonus": {"zh": "管理员：给非授权用户增加储存次数", "en": "Admin: add stored credits for guests"},
+    "cmd.bonus": {"zh": "管理员：给游客增加系统赠送次数", "en": "Admin: add system-gift credits for guests"},
     "cmd.announce": {"zh": "管理员：预览并发布 Markdown 公告", "en": "Admin: preview and publish an announcement"},
     "cmd.group": {"zh": "管理员：在群里授权该群使用缩略图", "en": "Admin: allow thumbnails in this group"},
     "menu.help": {"zh": "使用说明", "en": "Help"},
@@ -50,6 +50,7 @@ _STRINGS: dict[str, dict[str, str]] = {
     "menu.announce": {"zh": "发布公告", "en": "Announce"},
     "menu.guest": {"zh": "游客开关", "en": "Guest switch"},
     "menu.bonus": {"zh": "加次数", "en": "Add credits"},
+    "menu.sponsor": {"zh": "赞助换次数", "en": "Sponsor"},
     "pick.prompt": {
         "zh": "请选择语言。之后可以在设置里修改。\nChoose a language. You can change it later in Settings.",
         "en": "请选择语言。之后可以在设置里修改。\nChoose a language. You can change it later in Settings.",
@@ -64,8 +65,8 @@ _STRINGS: dict[str, dict[str, str]] = {
     "perm.none": {"zh": "你没有使用权限。", "en": "You don't have access."},
     "unknown_id": {"zh": "未知", "en": "unknown"},
     "quota.exhausted": {
-        "zh": "今天的 {limit} 次生成已经用完，储存次数也没有了。\n发送 /checkin 每天可再获得 1 到 3 次。\n",
-        "en": "Today's {limit} new generations are used up, and you have no stored credits.\n/checkin adds 1 to 3 stored credits once a day.\n",
+        "zh": "今天的免费保底已经用完，签到次数和系统赠送也没有了。\n发送 /checkin 每天可再获得 1 到 3 次签到次数。\n",
+        "en": "Today's free allowance is used up, and you have no check-in or gift credits.\n/checkin adds 1 to 3 check-in credits once a day.\n",
     },
     "quota.ad": {
         "zh": "看广告可获得 {reward} 次。点开广告后再点领取。\n",
@@ -86,7 +87,7 @@ _STRINGS: dict[str, dict[str, str]] = {
     "help.lead": {"zh": "使用说明：\n", "en": "How to use:\n"},
     "help.1": {"zh": "1. 直接发送视频，或将视频作为文件发送。\n", "en": "1. Send a video, or send it as a file.\n"},
     "help.2": {"zh": "2. 使用 /setting 选择帧数与横竖布局。\n", "en": "2. Use /setting to choose frame count and grid.\n"},
-    "help.3": {"zh": "3. 使用 /info 查看账号、授权状态和今日剩余次数。\n", "en": "3. Use /info for your account, access, and uses left today.\n"},
+    "help.3": {"zh": "3. 使用 /info 查看身份、用户组和次数。\n", "en": "3. Use /info for your identity, group, and credits.\n"},
     "help.4": {
         "zh": "4. {small}MB 以内按需读取，必要时可读取完整范围。\n",
         "en": "4. Files up to {small}MB are read as needed, including the full range if required.\n",
@@ -113,19 +114,19 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "\nAllow list, Announce, Guest switch, and Add credits are buttons too. /add and /del need a user ID. /bonus takes a number, for example /bonus 20.",
     },
     "help.guest": {
-        "zh": "\n\n未授权每天可新生成 {limit} 次。使用以前的生成结果不计入次数。 /checkin 每天可额外获得 1 到 3 次，存在储存次数里。",
-        "en": "\n\nGuests get {limit} new sheets a day. Reusing an old sheet is free. /checkin adds 1 to 3 stored credits once a day.",
+        "zh": "\n\n游客每天有 {limit} 次免费保底。/checkin 每天可再获得 1 到 3 次签到次数。系统赠送由管理员增加。使用以前的结果不计入次数。",
+        "en": "\n\nGuests get {limit} free generations a day. /checkin adds 1 to 3 check-in credits once a day. Admins can add system-gift credits. Reusing an old sheet is free.",
     },
     "help.guest_ad": {
-        "zh": " 看广告可获得 {reward} 次，也存在储存次数里。",
-        "en": " An ad adds {reward} stored credits too.",
+        "zh": " 看广告可获得 {reward} 次系统赠送。",
+        "en": " An ad adds {reward} system-gift credits.",
     },
     "id.line": {"zh": "你的 Telegram ID：{user_id}", "en": "Your Telegram ID: {user_id}"},
     "checkin.unavailable": {"zh": "签到暂时不可用。", "en": "Check-in is unavailable right now."},
-    "checkin.already": {"zh": "今天已经签到过了。储存次数：{stored}", "en": "Already checked in today. Stored credits: {stored}"},
+    "checkin.already": {"zh": "今天已经签到过了。签到次数：{stored}", "en": "Already checked in today. Check-in credits: {stored}"},
     "checkin.ok": {
-        "zh": "签到成功，获得 {gained} 次。储存次数：{total}\n这些次数可以留着，不占每天的 {limit} 次。",
-        "en": "Checked in, +{gained}. Stored credits: {total}\nThese don't count against the daily {limit}.",
+        "zh": "签到成功，获得 {gained} 次。签到次数：{total}\n这些次数可以留着，不占每天的免费保底。",
+        "en": "Checked in, +{gained}. Check-in credits: {total}\nThese don't count against the daily free allowance.",
     },
     "ad.disabled": {"zh": "广告功能未开启。", "en": "Ads are turned off."},
     "ad.not_live": {"zh": "看广告还未接入。", "en": "Ads are not connected yet."},
@@ -135,7 +136,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         "zh": "先点广告，再点领取。到账 {reward} 次后我会告诉你。",
         "en": "Open the ad, then tap claim. I'll tell you when {reward} credits arrive.",
     },
-    "ad.credited": {"zh": "看广告到账，获得 {reward} 次。储存次数：{total}", "en": "Ad reward arrived, +{reward}. Stored credits: {total}"},
+    "ad.credited": {"zh": "看广告到账，获得 {reward} 次。系统赠送：{total}", "en": "Ad reward arrived, +{reward}. System gift: {total}"},
     "status.body": {
         "zh": "运行状态：正常\n缩略图：{preset} / {width}px\n发送方式：{delivery}\n分块缓存：{cache}MB 内存 + 临时磁盘去重\n小文件阈值：{small}MB\n大视频预算：初始 {initial}，按需至 {hard}，最高 {cap}MB\n任务队列：处理中 {running}，排队 {waiting}（并发 {concurrency}）",
         "en": "Status: ok\nSheet: {preset} / {width}px\nDelivery: {delivery}\nChunk cache: {cache}MB memory + temp disk dedupe\nSmall-file threshold: {small}MB\nLarge-video budget: {initial} at first, up to {hard}, cap {cap}MB\nQueue: running {running}, waiting {waiting} (concurrency {concurrency})",
@@ -197,8 +198,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "Send an integer from 1 to {max}, or tap another button to cancel.",
     },
     "bonus.done": {
-        "zh": "已给 {count} 个非授权用户各增加 {amount} 次储存次数。\n这些次数不占每天的 10 次，每天的额度用完后才会扣。\n只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。",
-        "en": "Added {amount} stored credits to each of {count} guests.\nThese don't count against the daily 10, and are spent only after that daily allowance.\nOnly people who already chatted, have credits, or have settings. Later newcomers don't inherit this.",
+        "zh": "已给 {count} 个游客各增加 {amount} 次系统赠送。\n先扣每天的免费保底，再用签到次数，最后用系统赠送。\n只加给已经私聊过，或已经有次数、设置记录的人。之后新来的不会自动带上这次的次数。",
+        "en": "Added {amount} system-gift credits to each of {count} guests.\nFree allowance is spent first, then check-in credits, then gifts.\nOnly people who already chatted, have credits, or have settings. Later newcomers don't inherit this.",
     },
     "unknown_command": {"zh": "未知命令，请使用 /help 查看可用命令。", "en": "Unknown command. Use /help."},
     "group.admin_only": {"zh": "此命令仅限管理员使用。", "en": "Admins only."},
@@ -272,16 +273,48 @@ _STRINGS: dict[str, dict[str, str]] = {
     "info.username": {"zh": "用户名：{name}", "en": "Username: {name}"},
     "info.no_username": {"zh": "用户名：无", "en": "Username: none"},
     "info.id": {"zh": "Telegram ID：{user_id}", "en": "Telegram ID: {user_id}"},
-    "info.grant_admin": {"zh": "授权用户：是（管理员）", "en": "Access: yes (admin)"},
-    "info.grant_yes": {"zh": "授权用户：是", "en": "Access: yes"},
-    "info.grant_no": {"zh": "授权用户：否", "en": "Access: no"},
-    "info.unlimited": {"zh": "今日剩余次数：不限", "en": "New generations left today: unlimited"},
-    "info.remaining": {"zh": "今日剩余次数：{remaining}/{limit}", "en": "New generations left today: {remaining}/{limit}"},
-    "info.stored": {"zh": "储存次数：{stored}", "en": "Stored credits: {stored}"},
-    "info.reuse_note": {
-        "zh": "使用以前的生成记录不计入次数。每日签到获得的次数会存在这里。",
-        "en": "Reusing an old sheet is free. Check-in credits are stored here.",
+    "info.groups": {"zh": "用户组", "en": "Groups"},
+    "info.role_guest": {"zh": "❌ 游客：有次数限制", "en": "❌ Guest: limited credits"},
+    "info.role_guest_current": {"zh": "✅ 游客：有次数限制", "en": "✅ Guest: limited credits"},
+    "info.role_grant": {"zh": "❌ 授权用户：次数不限", "en": "❌ Allowed: unlimited"},
+    "info.role_grant_current": {"zh": "✅ 授权用户：次数不限", "en": "✅ Allowed: unlimited"},
+    "info.role_admin": {"zh": "❌ 管理员：次数不限", "en": "❌ Admin: unlimited"},
+    "info.role_admin_current": {"zh": "✅ 管理员：次数不限", "en": "✅ Admin: unlimited"},
+    "info.credits": {"zh": "次数", "en": "Credits"},
+    "info.daily": {"zh": "每日免费保底：{remaining}/{limit}", "en": "Daily free allowance: {remaining}/{limit}"},
+    "info.checkin": {"zh": "每日签到：{balance}（{status}）", "en": "Check-in credits: {balance} ({status})"},
+    "info.checked": {"zh": "今天已签到", "en": "checked in today"},
+    "info.not_checked": {"zh": "今天还没签到", "en": "not checked in today"},
+    "info.gift": {"zh": "系统赠送：{balance}", "en": "System gift: {balance}"},
+    "info.sponsor": {"zh": "赞助次数：{balance}", "en": "Sponsorship credits: {balance}"},
+    "info.spend_order": {
+        "zh": "先用每日免费保底，再用签到次数，再用赞助次数，最后用系统赠送。",
+        "en": "Free allowance first, then check-in, then sponsorship, then gifts.",
     },
+    "info.unlimited": {"zh": "使用次数：不限", "en": "Uses: unlimited"},
+    "info.unlimited_note": {
+        "zh": "免费保底、签到、赞助和系统赠送只统计游客。",
+        "en": "Credit buckets apply to guests only.",
+    },
+    "info.reuse_note": {
+        "zh": "使用以前的生成结果不计入次数。",
+        "en": "Reusing an old sheet does not use a credit.",
+    },
+    "stargate.on": {"zh": "赞助支付：开", "en": "Sponsorship payments: on"},
+    "stargate.off": {"zh": "赞助支付：关", "en": "Sponsorship payments: off"},
+    "stargate.opened": {"zh": "已打开赞助支付。游客可以买次数。", "en": "Sponsorship payments are on. Guests can buy credits."},
+    "stargate.closed": {"zh": "已关闭赞助支付。已经买到的次数还在。", "en": "Sponsorship payments are off. Credits already bought stay."},
+    "sponsor.off": {"zh": "赞助支付没开。", "en": "Sponsorship payments are off."},
+    "sponsor.unlimited": {"zh": "你的次数不限，不用买。", "en": "Your uses are unlimited. No need to buy credits."},
+    "sponsor.private": {"zh": "请到私聊里购买。", "en": "Open a private chat to buy credits."},
+    "sponsor.pick": {"zh": "选一档。次数加在你自己身上，不过期，也不能转给别人。", "en": "Pick a pack. Credits stay on your account, do not expire, and cannot be transferred."},
+    "sponsor.pack": {"zh": "{stars} 星 · {credits} 次", "en": "{stars} Stars · {credits} credits"},
+    "sponsor.paid": {"zh": "已到账 {credits} 次。赞助次数：{balance}", "en": "Added {credits} credits. Sponsorship balance: {balance}"},
+    "sponsor.refund": {"zh": "退还这次未使用的", "en": "Refund unused"},
+    "sponsor.refunded": {"zh": "已退回 {stars} 星，并扣回这次的 {credits} 次。", "en": "Refunded {stars} Stars and removed those {credits} credits."},
+    "sponsor.used": {"zh": "这次购买已经用过，不能退。星星只能整笔退。", "en": "This pack was already used, so it cannot be refunded. Stars refunds are all or nothing."},
+    "sponsor.refund_fail": {"zh": "退款没有完成，次数还在。", "en": "Refund did not finish. Your credits are unchanged."},
+    "sponsor.closed_guest": {"zh": "游客功能关着，现在不能买。", "en": "Guest access is paused, so packs are off."},
     "info.closed": {"zh": "使用状态：已关闭", "en": "Access: paused"},
     "forward.done": {"zh": "用户 {label} (<a href=\"tg://user?id={user_id}\">{user_id}</a>) 完成 {count} 个任务", "en": "User {label} (<a href=\"tg://user?id={user_id}\">{user_id}</a>) finished {count} jobs"},
     "forward.done_plain": {"zh": "用户 {label} 完成 {count} 个任务", "en": "User {label} finished {count} jobs"},
@@ -410,6 +443,7 @@ MENU_COMMANDS = {
     "announce": "/announce",
     "guest": "/guest toggle",
     "bonus": "/bonus",
+    "sponsor": "/sponsor",
 }
 THEME_KEYS = {
     "potplayer": "theme.potplayer",
@@ -458,7 +492,7 @@ def menu_actions() -> dict[str, str]:
     return actions
 
 
-def menu_rows(is_admin: bool, lang: str | None = None, *, ads_enabled: bool = True) -> tuple[tuple[str, ...], ...]:
+def menu_rows(is_admin: bool, lang: str | None = None, *, ads_enabled: bool = True, stars_enabled: bool = False) -> tuple[tuple[str, ...], ...]:
     rows: list[tuple[str, ...]] = []
     for key_row in USER_MENU_KEYS:
         labels = []
@@ -468,6 +502,8 @@ def menu_rows(is_admin: bool, lang: str | None = None, *, ads_enabled: bool = Tr
             labels.append(menu_label(key, lang))
         if labels:
             rows.append(tuple(labels))
+    if stars_enabled and not is_admin:
+        rows.append((menu_label("sponsor", lang),))
     if is_admin:
         for key_row in ADMIN_MENU_KEYS:
             rows.append(tuple(menu_label(key, lang) for key in key_row))
