@@ -169,6 +169,38 @@ def command_mention(text: str | None) -> str | None:
     return mention or None
 
 
+def mentions_bot(message: Any, username: str | None) -> bool:
+    """True when this message @-mentions this bot, not another account."""
+    if getattr(message, "mentioned", False):
+        return True
+    wanted = (username or "").strip().lstrip("@").lower()
+    if not wanted:
+        return False
+    text = getattr(message, "raw_text", None) or getattr(message, "message", None) or ""
+    entities = getattr(message, "entities", None) or []
+    for entity in entities:
+        if type(entity).__name__ != "MessageEntityMention":
+            continue
+        offset = int(getattr(entity, "offset", 0) or 0)
+        length = int(getattr(entity, "length", 0) or 0)
+        token = text[offset:offset + length].lstrip("@").lower()
+        if token == wanted:
+            return True
+    needle = "@" + wanted
+    lower = text.lower()
+    start = 0
+    while True:
+        index = lower.find(needle, start)
+        if index < 0:
+            return False
+        end = index + len(needle)
+        before_ok = index == 0 or not (lower[index - 1].isalnum() or lower[index - 1] == "_")
+        after_ok = end >= len(lower) or not (lower[end].isalnum() or lower[end] == "_")
+        if before_ok and after_ok:
+            return True
+        start = index + 1
+
+
 def permission_message(user_id: int | None, lang: str | None = None) -> str:
     return t(lang, "perm.denied", user_id=user_id or t(lang, "unknown_id"))
 
@@ -660,7 +692,7 @@ async def _handle_group_command(
         text = "已取消这个群的缩略图授权。" if removed else "这个群本来就没有授权。"
     else:
         added = await groups.add(chat_id)
-        text = "已授权这个群。授权用户或管理员回复视频并发送 /thumb 即可生成。" if added else "这个群已经授权过了。"
+        text = "已授权这个群。回复视频并 @ 机器人即可生成，次数扣发消息的人。授权用户也可以继续用 /thumb。" if added else "这个群已经授权过了。"
     await client.send_message(message.chat_id, text, reply_to=message.id)
 
 
@@ -723,6 +755,89 @@ async def _handle_thumb_command(
         )
         return
     enqueue(replied, **job_kwargs)
+
+
+async def _handle_group_mention(
+    client: TelegramClient,
+    access: AccessControl,
+    groups: GroupAccess | None,
+    task_log: TaskLog | None,
+    message: Any,
+    enqueue,
+    preferences: UserPreferences | None,
+    guest_gate: "GuestGate | None",
+    settings: Settings,
+) -> bool:
+    """Reply-to-video plus @bot starts a sheet. Quota is the mention sender's."""
+    if not _is_group_message(message):
+        return False
+    username = await _bot_username(client)
+    if not mentions_bot(message, username):
+        return False
+    lang = preferences.get_lang(message.sender_id) if preferences is not None else None
+    if groups is None or not groups.is_authorized(message.chat_id):
+        await client.send_message(message.chat_id, t(lang, "mention.unauthorized"), reply_to=message.id)
+        return True
+    if not getattr(message, "is_reply", False):
+        await client.send_message(message.chat_id, t(lang, "mention.need_video"), reply_to=message.id)
+        return True
+    try:
+        replied = await message.get_reply_message()
+    except Exception:
+        replied = None
+    if replied is None or extract_video(replied) is None:
+        await client.send_message(message.chat_id, t(lang, "mention.need_video"), reply_to=message.id)
+        return True
+    if enqueue is None:
+        await client.send_message(message.chat_id, "任务队列还没准备好。", reply_to=message.id)
+        return True
+    sender_id = message.sender_id
+    if guests_closed(access, guest_gate, sender_id):
+        await client.send_message(message.chat_id, t(lang, "guest.closed"), reply_to=message.id)
+        return True
+    if sender_id is not None and not access.has_grant(sender_id):
+        if task_log is None or not task_log.can_generate(sender_id):
+            await client.send_message(
+                message.chat_id,
+                quota_message(
+                    settings.guest_daily_limit,
+                    settings.community_url,
+                    settings.ad_reward,
+                    settings.ads_live and SHOW_AD_BUTTON,
+                    lang,
+                ),
+                reply_to=message.id,
+            )
+            return True
+    header_id, quote_top_id = _quote_ids(message)
+    sender = getattr(message, "sender", None)
+    mention_label = format_user_label(sender, sender_id)
+    job_kwargs = dict(
+        preference_user_id=sender_id,
+        offer_pack=False,
+        quote_msg_id=header_id or getattr(replied, "id", None),
+        quote_top_id=quote_top_id,
+        command_msg_id=message.id,
+        header_msg_id=header_id,
+        mention_user_id=sender_id,
+        mention_label=mention_label,
+    )
+    key = file_key(replied)
+    record = task_log.lookup(key, content_key(replied)) if task_log is not None and key else None
+    if record:
+        await _offer_previous_result(
+            client,
+            replied,
+            record,
+            key or "",
+            requester_id=sender_id,
+            enqueue_kwargs=job_kwargs,
+            mention_html=_html_mention(sender_id, mention_label),
+            lang=lang,
+        )
+        return True
+    enqueue(replied, **job_kwargs)
+    return True
 
 
 def _announce_edit_text(message: Any) -> str | None:
@@ -3360,6 +3475,47 @@ async def process_message(
         await queue.leave()
 
 
+def _limit_borrowed_dc_connect(client: TelegramClient) -> None:
+    """Give another DC the same connect timeout as the main session.
+
+    Telethon creates that extra connection with no timeout, so a stuck
+    handshake waits for the kernel (about two minutes). ffprobe then
+    sees zero bytes and reports a frame timeout.
+    """
+    from telethon.network import MTProtoSender
+    from telethon.tl import functions
+    from telethon.tl.alltlobjects import LAYER
+
+    async def _create_exported_sender(dc_id):
+        dc = await client._get_dc(dc_id)
+        sender = MTProtoSender(
+            None,
+            loggers=client._log,
+            connect_timeout=client._timeout,
+            retries=client._connection_retries,
+            delay=client._retry_delay,
+            auto_reconnect=client._auto_reconnect,
+        )
+        await sender.connect(client._connection(
+            dc.ip_address,
+            dc.port,
+            dc.id,
+            loggers=client._log,
+            proxy=client._proxy,
+            local_addr=client._local_addr,
+        ))
+        client._log[__name__].info("Exporting auth for new borrowed sender in %s", dc)
+        auth = await client(functions.auth.ExportAuthorizationRequest(dc_id))
+        client._init_request.query = functions.auth.ImportAuthorizationRequest(
+            id=auth.id, bytes=auth.bytes,
+        )
+        await sender.send(functions.InvokeWithLayerRequest(LAYER, client._init_request))
+        return sender
+
+    client._create_exported_sender = _create_exported_sender
+    logging.info("Borrowed DC connect timeout is %ss", client._timeout)
+
+
 async def poll() -> None:
     settings = Settings.from_env()
     configure_logging(settings.bot_token)
@@ -3384,6 +3540,7 @@ async def poll() -> None:
         auto_reconnect=True,
         flood_sleep_threshold=0,
     )
+    _limit_borrowed_dc_connect(mt_client)
     _install_fast_upload(mt_client)
     media_server = MTProtoRangeServer(
         mt_client,
@@ -3495,6 +3652,18 @@ async def poll() -> None:
         ):
             return
         if event.is_group:
+            if await _handle_group_mention(
+                mt_client,
+                access,
+                groups,
+                task_log,
+                event.message,
+                _start_generation,
+                preferences,
+                guest_gate,
+                settings,
+            ):
+                return
             return
         if event.is_private and event.sender_id in _bonus_wait and access.is_admin(event.sender_id):
             if getattr(event.message, "media", None) or extract_video(event.message):

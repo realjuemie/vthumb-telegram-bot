@@ -99,7 +99,9 @@ _STRINGS: dict[str, dict[str, str]] = {
     "help.6": {"zh": "6. 已读取分块会临时缓存，任务结束后自动删除。\n", "en": "6. Fetched chunks are cached for the job, then deleted.\n"},
     "help.7": {"zh": "7. 多人同时发送会按到达顺序排队，轮到你时自动开始。\n", "en": "7. Simultaneous jobs wait in arrival order and start on their own.\n"},
     "help.8": {"zh": "8. 以文件发送的视频，缩略图完成后可合并成一条文件消息。\n", "en": "8. A file-sent video can be packed with its sheet into one file message.\n"},
-    "help.9": {"zh": "9. 已授权的群里，回复视频并发送 /thumb。任务和私聊共用队列。", "en": "9. In an allowed group, reply to a video with /thumb. It shares the private queue."},
+    "help.9": {"zh": "9. 已授权的群里，回复视频并 @ 机器人即可生成，次数扣发这条消息的人。授权用户也可以用 /thumb。任务和私聊共用队列。", "en": "9. In an allowed group, reply to a video and mention the bot. The person who sent that message spends a credit. Granted users can also use /thumb. It shares the private queue."},
+    "mention.need_video": {"zh": "请回复一条视频，并 @ 我，即可生成。", "en": "Reply to a video and mention me to make a sheet."},
+    "mention.unauthorized": {"zh": "这个群还没有授权。请管理员在群里发送 /group。", "en": "This group is not allowed yet. An admin should send /group here."},
     "help.10": {
         "zh": "\n10. 点「看广告」后，先点广告，再点领取。到账后我会告诉你。",
         "en": "\n10. Tap Watch ad, open the ad, then tap claim. I'll tell you when the credits arrive.",

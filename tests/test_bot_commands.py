@@ -9,6 +9,7 @@ from app.bot import (
     account_info_text,
     command_name,
     command_mention,
+    mentions_bot,
     command_user_id,
     menu_action,
     menu_rows,
@@ -62,6 +63,16 @@ class BotCommandTests(unittest.TestCase):
         self.assertEqual(command_name("/help@killfatsbot extra"), "help")
         self.assertEqual(command_mention("/help@killfatsbot extra"), "killfatsbot")
         self.assertIsNone(command_mention("/help extra"))
+
+    def test_mentions_bot_matches_at_username_not_a_prefix(self) -> None:
+        hit = type("M", (), {"raw_text": "生成一下 @vthumbot", "mentioned": False, "entities": None})()
+        miss = type("M", (), {"raw_text": "@otherbot 看这个", "mentioned": False, "entities": None})()
+        prefix = type("M", (), {"raw_text": "@vthumbot_fan", "mentioned": False, "entities": None})()
+        self.assertTrue(mentions_bot(hit, "Vthumbot"))
+        self.assertFalse(mentions_bot(miss, "vthumbot"))
+        self.assertFalse(mentions_bot(prefix, "vthumbot"))
+        flagged = type("M", (), {"raw_text": "hi", "mentioned": True, "entities": None})()
+        self.assertTrue(mentions_bot(flagged, "vthumbot"))
 
     def test_menu_commands_are_unique_and_lowercase(self) -> None:
         names = [name for name, _ in BOT_COMMANDS]
@@ -279,6 +290,92 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         command = type("C", (), {"reply_to": header})()
         self.assertEqual(_quote_ids(command), (55, 9))
         self.assertEqual(_quote_ids(type("C", (), {"reply_to": None})()), (None, None))
+
+
+class GroupMentionTests(unittest.TestCase):
+    def test_mention_enqueues_video_but_charges_the_sender(self) -> None:
+        asyncio.run(self._mention_enqueues_video_but_charges_the_sender())
+
+    async def _mention_enqueues_video_but_charges_the_sender(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from app.access_control import AccessControl, GroupAccess
+        from app.bot import _bot_username_cache, _handle_group_mention
+        from app.task_log import TaskLog
+        from app.user_preferences import UserPreferences
+        from tests.test_settings import make_settings
+
+        import app.bot as bot_mod
+
+        calls = []
+
+        def enqueue(message, **kwargs):
+            calls.append((message, kwargs))
+
+        class Client:
+            async def get_me(self):
+                return type("U", (), {"username": "vthumbot"})()
+
+            async def send_message(self, *args, **kwargs):
+                raise AssertionError("should enqueue, not reply")
+
+        file_info = type("F", (), {"name": "clip.mp4", "mime_type": "video/mp4", "size": 10})()
+        document = type("D", (), {"mime_type": "video/mp4", "size": 10, "id": 42})()
+        replied = type("R", (), {
+            "id": 77,
+            "sender_id": 555,
+            "video": True,
+            "document": document,
+            "file": file_info,
+            "chat_id": -100,
+        })()
+
+        class Mention:
+            is_group = True
+            is_private = False
+            is_reply = True
+            mentioned = True
+            sender_id = 9
+            sender = type("S", (), {"username": "guest", "first_name": "Guest", "last_name": None})()
+            chat_id = -100
+            id = 88
+            raw_text = "@vthumbot"
+            reply_to = None
+
+            async def get_reply_message(self):
+                return replied
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            access = AccessControl(root / "access.json", frozenset({1}), open_access=True)
+            groups = GroupAccess(root / "groups.json")
+            await groups.add(-100)
+            log = TaskLog(root / "task_log.json")
+            prefs = UserPreferences(root / "preferences.json")
+            previous = bot_mod._bot_username_cache
+            bot_mod._bot_username_cache = "vthumbot"
+            try:
+                consumed = await _handle_group_mention(
+                    Client(),
+                    access,
+                    groups,
+                    log,
+                    Mention(),
+                    enqueue,
+                    prefs,
+                    None,
+                    make_settings(),
+                )
+            finally:
+                bot_mod._bot_username_cache = previous
+        self.assertTrue(consumed)
+        self.assertEqual(len(calls), 1)
+        queued, kwargs = calls[0]
+        self.assertIs(queued, replied)
+        self.assertEqual(kwargs["preference_user_id"], 9)
+        self.assertEqual(kwargs["mention_user_id"], 9)
+        self.assertNotEqual(kwargs["preference_user_id"], replied.sender_id)
 
 
 if __name__ == "__main__":
